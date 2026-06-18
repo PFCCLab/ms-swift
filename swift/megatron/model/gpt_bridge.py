@@ -1297,7 +1297,10 @@ class GPTBridge:
             self._set_state_dict(mg_layer, 'input_layernorm.weight', hf_state_dict, 'input_layernorm.weight', to_mcore)
         else:
             hf_state_dict.update(self._set_attn_state(mg_attn, hf_state_dict, 'self_attn.', layer_idx, to_mcore))
-            self._set_state_dict(mg_layer, 'self_attention.linear_qkv.layer_norm_weight', hf_state_dict,
+            # alignment: with use_transformer_engine=False (local spec), the
+            # input layernorm weight lives on a standalone `input_layernorm`
+            # module, not folded into `linear_qkv.layer_norm_weight`.
+            self._set_state_dict(mg_layer, 'input_layernorm.weight', hf_state_dict,
                                  'input_layernorm.weight', to_mcore)
         return hf_state_dict
 

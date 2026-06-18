@@ -176,7 +176,7 @@ class MegatronModelConfig(TransformerConfig):
     layernorm_zero_centered_gamma: bool = False
 
     # Override
-    persist_layer_norm: bool = True
+    persist_layer_norm: bool = False
     deallocate_pipeline_outputs: bool = True
     cp_comm_type: str = 'p2p'
 

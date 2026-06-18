@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import (get_gpt_decoder_block_spec,
+                                                      get_gpt_layer_local_spec,
                                                       get_gpt_layer_with_transformer_engine_spec,
                                                       get_gpt_mtp_block_spec)
 from packaging import version
@@ -82,7 +83,7 @@ class MegatronModelLoader:
         if self.config.num_moe_experts:
             kwargs = {'qk_l2_norm': self.config.qk_l2_norm, 'vp_stage': vp_stage} if self.mcore_013 else {}
             transformer_layer_spec = get_gpt_decoder_block_spec(
-                self.config, use_transformer_engine=True, normalization=self.config.normalization, **kwargs)
+                self.config, use_transformer_engine=False, normalization=self.config.normalization, **kwargs)
         else:
             transformer_layer_spec = self._get_transformer_layer_spec()
         return transformer_layer_spec
@@ -90,7 +91,10 @@ class MegatronModelLoader:
     def _get_transformer_layer_spec(self):
         config = self.config
         kwargs = {'qk_l2_norm': config.qk_l2_norm} if self.mcore_013 else {}
-        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+        # alignment: use local spec to avoid TE DotProductAttention path,
+        # which requires a TE backend (FA / cuDNN / unfused) that may be
+        # unavailable in this environment.
+        transformer_layer_spec = get_gpt_layer_local_spec(
             config.num_moe_experts,
             self.args.moe_grouped_gemm,
             config.qk_layernorm,
@@ -109,7 +113,7 @@ class MegatronModelLoader:
             transformer_layer_spec_for_mtp = transformer_layer_spec
         kwargs = {'vp_stage': vp_stage} if self.mcore_013 else {}
         return get_gpt_mtp_block_spec(
-            self.config, transformer_layer_spec_for_mtp, use_transformer_engine=True, **kwargs)
+            self.config, transformer_layer_spec_for_mtp, use_transformer_engine=False, **kwargs)
 
     def _set_shared_expert_gate(self, transformer_layer_spec):
         if (self.config.use_shared_expert_gate and self.config.num_moe_experts
