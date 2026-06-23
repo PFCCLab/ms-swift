@@ -21,6 +21,7 @@ class ChatmlTemplateMeta(TemplateMeta):
 
 @dataclass
 class EmptyTemplateMeta(TemplateMeta):
+    suffix: Prompt = field(default_factory=list)  # 空列表，不添加任何后缀token
     prefix: Prompt = field(default_factory=list)
     prompt: Prompt = field(default_factory=lambda: ['{{QUERY}}'])
     chat_sep: Optional[Prompt] = None
