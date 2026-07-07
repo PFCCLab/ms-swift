@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import os
 import re
 import torch.nn.functional as F
 from dataclasses import dataclass, fields
@@ -176,7 +177,7 @@ class MegatronModelConfig(TransformerConfig):
     layernorm_zero_centered_gamma: bool = False
 
     # Override
-    persist_layer_norm: bool = False
+    persist_layer_norm: bool = True
     deallocate_pipeline_outputs: bool = True
     cp_comm_type: str = 'p2p'
 
@@ -219,6 +220,11 @@ class MegatronModelConfig(TransformerConfig):
                 setattr(self, name, value)
 
     def __post_init__(self):
+        # alignment: use_accuracy_compatible switches to the local (non-TE) spec, whose
+        # standalone LayerNorm modules are incompatible with the persistent LN fusion.
+        # Disable it here; otherwise keep the Megatron default (persistent LN enabled).
+        if os.environ.get('USE_ACCURACY_COMPATIBLE', '0') == '1':
+            self.persist_layer_norm = False
         self._augment_mindspeed_defaults()
         self._format_config()
         if self.moe_router_dtype.lower() == 'none':

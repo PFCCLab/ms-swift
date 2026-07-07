@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
 import megatron.core
+import os
 import re
 import torch
 import torch.distributed as dist
@@ -22,6 +23,15 @@ from swift.utils import (MxFp4Dequantizer, SafetensorLazyLoader, StreamingSafete
 from ..tuners import LoraParallelLinear
 
 logger = get_logger()
+
+
+def _use_accuracy_compatible() -> bool:
+    """Runtime switch for the PaddleFleet<->Megatron bit-alignment patches.
+
+    Driven by ms-swift's ``use_accuracy_compatible`` arg via the ``USE_ACCURACY_COMPATIBLE``
+    env var. Defaults to False so the original TE-folded layernorm layout is used.
+    """
+    return os.environ.get('USE_ACCURACY_COMPATIBLE', '0') == '1'
 
 mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
 
@@ -1297,11 +1307,16 @@ class GPTBridge:
             self._set_state_dict(mg_layer, 'input_layernorm.weight', hf_state_dict, 'input_layernorm.weight', to_mcore)
         else:
             hf_state_dict.update(self._set_attn_state(mg_attn, hf_state_dict, 'self_attn.', layer_idx, to_mcore))
-            # alignment: with use_transformer_engine=False (local spec), the
-            # input layernorm weight lives on a standalone `input_layernorm`
-            # module, not folded into `linear_qkv.layer_norm_weight`.
-            self._set_state_dict(mg_layer, 'input_layernorm.weight', hf_state_dict,
-                                 'input_layernorm.weight', to_mcore)
+            if _use_accuracy_compatible():
+                # alignment: with use_transformer_engine=False (local spec), the
+                # input layernorm weight lives on a standalone `input_layernorm`
+                # module, not folded into `linear_qkv.layer_norm_weight`.
+                self._set_state_dict(mg_layer, 'input_layernorm.weight', hf_state_dict,
+                                     'input_layernorm.weight', to_mcore)
+            else:
+                # original: TE spec folds the input layernorm into linear_qkv.
+                self._set_state_dict(mg_layer, 'self_attention.linear_qkv.layer_norm_weight', hf_state_dict,
+                                     'input_layernorm.weight', to_mcore)
         return hf_state_dict
 
     def _set_layer_mlp(self, mg_layer, hf_state_dict, layer_idx: int, to_mcore: bool):

@@ -1,4 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import os
+
 import megatron.core
 from dataclasses import dataclass
 from megatron.core import mpu
@@ -23,6 +25,15 @@ if TYPE_CHECKING:
 
 MEGATRON_MODEL_MAPPING = {}
 logger = get_logger()
+
+
+def _use_accuracy_compatible() -> bool:
+    """Runtime switch for the PaddleFleet<->Megatron bit-alignment patches.
+
+    Driven by ms-swift's ``use_accuracy_compatible`` arg via the ``USE_ACCURACY_COMPATIBLE``
+    env var. Defaults to False so the original TE-based specs are used when disabled.
+    """
+    return os.environ.get('USE_ACCURACY_COMPATIBLE', '0') == '1'
 
 
 @dataclass
@@ -80,10 +91,13 @@ class MegatronModelLoader:
             self.model_cls = MultimodalGPTModel if self.args.is_multimodal else GPTModel
 
     def get_transformer_layer_spec(self, vp_stage: Optional[int] = None):
+        # alignment: use_accuracy_compatible disables TE (local spec) to avoid the TE
+        # DotProductAttention path and match PaddleFleet numerics; otherwise keep TE.
+        use_te = not _use_accuracy_compatible()
         if self.config.num_moe_experts:
             kwargs = {'qk_l2_norm': self.config.qk_l2_norm, 'vp_stage': vp_stage} if self.mcore_013 else {}
             transformer_layer_spec = get_gpt_decoder_block_spec(
-                self.config, use_transformer_engine=False, normalization=self.config.normalization, **kwargs)
+                self.config, use_transformer_engine=use_te, normalization=self.config.normalization, **kwargs)
         else:
             transformer_layer_spec = self._get_transformer_layer_spec()
         return transformer_layer_spec
@@ -91,16 +105,25 @@ class MegatronModelLoader:
     def _get_transformer_layer_spec(self):
         config = self.config
         kwargs = {'qk_l2_norm': config.qk_l2_norm} if self.mcore_013 else {}
-        # alignment: use local spec to avoid TE DotProductAttention path,
-        # which requires a TE backend (FA / cuDNN / unfused) that may be
-        # unavailable in this environment.
-        transformer_layer_spec = get_gpt_layer_local_spec(
-            config.num_moe_experts,
-            self.args.moe_grouped_gemm,
-            config.qk_layernorm,
-            config.multi_latent_attention,
-            **kwargs,
-        )
+        if _use_accuracy_compatible():
+            # alignment: use local spec to avoid TE DotProductAttention path,
+            # which requires a TE backend (FA / cuDNN / unfused) that may be
+            # unavailable in this environment.
+            transformer_layer_spec = get_gpt_layer_local_spec(
+                config.num_moe_experts,
+                self.args.moe_grouped_gemm,
+                config.qk_layernorm,
+                config.multi_latent_attention,
+                **kwargs,
+            )
+        else:
+            transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                config.num_moe_experts,
+                self.args.moe_grouped_gemm,
+                config.qk_layernorm,
+                config.multi_latent_attention,
+                **kwargs,
+            )
         return transformer_layer_spec
 
     def get_mtp_block_spec(self, transformer_layer_spec, vp_stage: Optional[int] = None):
@@ -113,7 +136,8 @@ class MegatronModelLoader:
             transformer_layer_spec_for_mtp = transformer_layer_spec
         kwargs = {'vp_stage': vp_stage} if self.mcore_013 else {}
         return get_gpt_mtp_block_spec(
-            self.config, transformer_layer_spec_for_mtp, use_transformer_engine=False, **kwargs)
+            self.config, transformer_layer_spec_for_mtp, use_transformer_engine=not _use_accuracy_compatible(),
+            **kwargs)
 
     def _set_shared_expert_gate(self, transformer_layer_spec):
         if (self.config.use_shared_expert_gate and self.config.num_moe_experts

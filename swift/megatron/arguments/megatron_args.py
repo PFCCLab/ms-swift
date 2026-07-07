@@ -342,6 +342,12 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     optimizer_cpu_offload: bool = False
     optimizer_offload_fraction: float = 1.
     use_precision_aware_optimizer: bool = False
+    # Master switch for PaddleFleet<->Megatron bit-alignment patches contributed by
+    # ningzhengsheng in ms-swift and Megatron-LM. When True the patched (accuracy-aligned)
+    # code paths are enabled; when False every patched site falls back to the original logic.
+    # Exported to the `USE_ACCURACY_COMPATIBLE` env var in __post_init__ so both ms-swift and
+    # Megatron-LM core (incl. standalone/autograd functions without config access) can read it.
+    use_accuracy_compatible: bool = False
     main_grads_dtype: Literal['fp32', 'bf16'] = 'fp32'
     main_params_dtype: Literal['fp32', 'fp16'] = 'fp32'
     exp_avg_dtype: Literal['fp32', 'fp16', 'bf16', 'fp8'] = 'fp32'
@@ -567,6 +573,10 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
         RLHFMegatronArgumentsMixin.__post_init__(self)
         MegatronTunerMixin.__post_init__(self)
         os.environ.setdefault('CUDA_DEVICE_MAX_CONNECTIONS', '1')
+        # Propagate the accuracy-alignment switch to a process-wide env var so that both
+        # ms-swift and Megatron-LM patched code paths (including moe_utils standalone /
+        # autograd functions that have no config access) can gate on a single source.
+        os.environ['USE_ACCURACY_COMPATIBLE'] = '1' if self.use_accuracy_compatible else '0'
         if self.recompute_granularity == 'none':
             self.recompute_granularity = None
         if self.recompute_granularity == 'selective' and self.recompute_method is not None:

@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -21,7 +22,11 @@ class ChatmlTemplateMeta(TemplateMeta):
 
 @dataclass
 class EmptyTemplateMeta(TemplateMeta):
-    suffix: Prompt = field(default_factory=list)  # 空列表，不添加任何后缀token
+    # alignment: with use_accuracy_compatible (USE_ACCURACY_COMPATIBLE=1) the dummy template
+    # adds no suffix token, so raw text -> token_ids matches PaddleFleet bit-for-bit. When the
+    # switch is off, keep the base TemplateMeta default suffix ([['eos_token_id']]).
+    suffix: Prompt = field(
+        default_factory=lambda: [] if os.environ.get('USE_ACCURACY_COMPATIBLE', '0') == '1' else [['eos_token_id']])
     prefix: Prompt = field(default_factory=list)
     prompt: Prompt = field(default_factory=lambda: ['{{QUERY}}'])
     chat_sep: Optional[Prompt] = None
