@@ -577,6 +577,22 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
         # ms-swift and Megatron-LM patched code paths (including moe_utils standalone /
         # autograd functions that have no config access) can gate on a single source.
         os.environ['USE_ACCURACY_COMPATIBLE'] = '1' if self.use_accuracy_compatible else '0'
+        if self.use_accuracy_compatible:
+            # The dummy (Empty) template meta is instantiated at *import* time, which happens
+            # before this env var is set, so its `suffix` field may have been baked with the
+            # default eos token ([['eos_token_id']]). That extra eos changes the tokenized
+            # input and breaks bit-alignment with PaddleFleet from the very first layer.
+            # The template is only materialized later (via a deepcopy of this registered meta),
+            # so re-syncing the singleton's suffix here is sufficient and does not depend on
+            # the launch script exporting the env var before the interpreter starts.
+            try:
+                from swift.template.constant import LLMTemplateType
+                from swift.template.register import TEMPLATE_MAPPING
+                dummy_meta = TEMPLATE_MAPPING.get(LLMTemplateType.dummy)
+                if dummy_meta is not None:
+                    dummy_meta.suffix = []
+            except Exception as e:  # pragma: no cover - defensive, never block startup
+                logger.warning(f'Failed to sync dummy template suffix for use_accuracy_compatible: {e}')
         if self.recompute_granularity == 'none':
             self.recompute_granularity = None
         if self.recompute_granularity == 'selective' and self.recompute_method is not None:
