@@ -366,6 +366,11 @@ def _patch_peft_BaseTuner():
 def _patch_TEGroupedLinear():
     from megatron.core.extensions.transformer_engine import TEGroupedLinear
 
+    # TEGroupedLinear is None when transformer_engine is disabled (HAVE_TE=False,
+    # used for MiniMax<->PaddleFleet alignment). Nothing to patch in that case.
+    if TEGroupedLinear is None:
+        return
+
     def sharded_state_dict(
             self,
             prefix: str = '',
