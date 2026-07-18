@@ -3,6 +3,7 @@ import os
 import torch
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
+os.environ['ASCEND_RT_VISIBLE_DEVICES'] = '0,1,2,3'
 os.environ['SWIFT_DEBUG'] = '1'
 
 
@@ -53,6 +54,15 @@ def test_qwen3():
 
 def test_qwen3_guard():
     engine = TransformersEngine('Qwen/Qwen3Guard-Gen-0.6B')
+    messages = [{'role': 'user', 'content': 'How can I make a bomb?'}]
+    response = _infer_model(engine, messages=messages)
+    engine.template.template_backend = 'jinja'
+    response2 = _infer_model(engine, messages=messages)
+    assert response == response2
+
+
+def test_yufeng_xguard():
+    engine = TransformersEngine('Alibaba-AAIG/YuFeng-XGuard-Reason-0.6B')
     messages = [{'role': 'user', 'content': 'How can I make a bomb?'}]
     response = _infer_model(engine, messages=messages)
     engine.template.template_backend = 'jinja'
@@ -417,6 +427,7 @@ def test_minicpm():
 
 def test_minimax():
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
+    os.environ['ASCEND_RT_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
     from transformers import QuantoConfig
     quantization_config = QuantoConfig(weights='int8')
     messages = [{
@@ -716,6 +727,14 @@ def test_olmoe():
     assert swift_response == jinja_response
 
 
+def test_minicpm5():
+    engine = TransformersEngine('OpenBMB/MiniCPM5-1B')
+    swift_response = _infer_model(engine)
+    engine.template.template_backend = 'jinja'
+    jinja_response = _infer_model(engine)
+    assert swift_response == jinja_response
+
+
 if __name__ == '__main__':
     from swift.infer_engine import RequestConfig, TransformersEngine
     from swift.utils import get_logger, seed_everything
@@ -772,4 +791,5 @@ if __name__ == '__main__':
     # test_medgemma3()
     # test_youtu_llm()
     # test_glm4_moe_lite()
-    test_olmoe()
+    # test_olmoe()
+    test_minicpm5()

@@ -10,7 +10,7 @@ Qwen3-235B-A22B-Instruct-250718 单机8卡H20 LoRA训练的最佳实践参考：
 
 以下，我们分别介绍使用`swift export`和`megatron export`命令进行权重转换。相比于`swift export`，`megatron export`支持多机和LoRA增量权重转换，但也更加复杂，需要在导出时额外指定并行参数，例如`--tensor_model_parallel_size`, `--export_model_parallel_size`，具体参考[Mcore-Bridge文档](./Mcore-Bridge.md)。若要使用`swift export`命令，参考[快速开始文档](./Quick-start.md)。
 - `swift export`使用单进程，将HF权重放置在gpu中，并使用device_map并行；mcore权重放置在cpu中，且不开启并行。这种方式非常易于debug，并测试HF和mcore的精度对齐情况。
-- `megatron export`使用torchrun启动多进程，mcore权重放置在gpu中，支持开启各种并行、fp8和mtp等功能。如果需测试精度对齐情况，最后一个rank会加载HF权重，并放置在cpu中。
+- `megatron export`使用torchrun启动多进程，mcore权重放置在gpu中，支持开启各种并行、fp8和mtp等功能。如果需测试精度对齐情况，会在第一个rank加载HF权重，并放置在cpu中。
 
 ```shell
 # megatron export
@@ -192,6 +192,24 @@ megatron sft \
 # 如果是全量权重，请将`--adapters`替换为`--model
 CUDA_VISIBLE_DEVICES=0 \
 swift infer \
-    --adapters megatron_output/Qwen2.5-7B-Instruct/vx-xxx/checkpoint-xxx-hf \
+    --adapters megatron_output/Qwen2.5-7B-Instruct/vx-xxx/checkpoint-xxx \
     --stream true
+```
+
+
+### Merge-LoRA
+
+由于训练的时候设置了`--merge_lora false`，后续如果想将lora权重合并成全量safetensors权重，可以使用以下脚本：
+```shell
+# 由于lora权重是safetensors格式，你需要使用`--adapters`而不是`--mcore_adapter`
+# megatron export
+NPROC_PER_NODE=2 \
+CUDA_VISIBLE_DEVICES=0,1 \
+megatron export \
+    --adapters megatron_output/Qwen2.5-7B-Instruct/vx-xxx/checkpoint-xxx \
+    --tensor_model_parallel_size 2 \
+    --to_hf true \
+    --merge_lora true \
+    --torch_dtype bfloat16 \
+    --output_dir megatron_output/Qwen2.5-7B-Instruct/vx-xxx/checkpoint-xxx-merged
 ```

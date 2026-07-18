@@ -3,6 +3,7 @@ import numpy as np
 import os
 from contextlib import nullcontext
 from datasets import Dataset as HfDataset
+from datasets import IterableDataset as HfIterableDataset
 from datasets import load_dataset as hf_load_dataset
 from functools import partial
 from modelscope.hub.utils.utils import get_cache_dir
@@ -30,6 +31,7 @@ class DatasetLoader(BaseDatasetLoader):
         download_mode: Literal['force_redownload', 'reuse_dataset_if_exists'] = 'reuse_dataset_if_exists',
         columns: Optional[Dict[str, str]] = None,
         remove_unused_columns: bool = True,
+        disable_auto_column_mapping: bool = False,
     ):
         self.num_proc = num_proc
         self.load_from_cache_file = load_from_cache_file
@@ -39,6 +41,7 @@ class DatasetLoader(BaseDatasetLoader):
         self.download_mode = download_mode
         self.columns = columns
         self.remove_unused_columns = remove_unused_columns
+        self.disable_auto_column_mapping = disable_auto_column_mapping
 
     def _load_dataset_path(
         self,
@@ -56,7 +59,11 @@ class DatasetLoader(BaseDatasetLoader):
         if self.columns:
             dataset = RowPreprocessor.safe_rename_columns(dataset, self.columns)
         dataset = dataset_meta.preprocess_func(
-            dataset, num_proc=self.num_proc, load_from_cache_file=self.load_from_cache_file, strict=self.strict)
+            dataset,
+            num_proc=self.num_proc,
+            load_from_cache_file=self.load_from_cache_file,
+            strict=self.strict,
+            enable_auto_mapping=not self.disable_auto_column_mapping)
         if self.remove_unused_columns:
             dataset = RowPreprocessor.remove_useless_columns(dataset)
         return dataset
@@ -122,7 +129,11 @@ class DatasetLoader(BaseDatasetLoader):
             if self.columns:
                 dataset = RowPreprocessor.safe_rename_columns(dataset, self.columns)
             dataset = subset.preprocess_func(
-                dataset, num_proc=self.num_proc, load_from_cache_file=self.load_from_cache_file, strict=self.strict)
+                dataset,
+                num_proc=self.num_proc,
+                load_from_cache_file=self.load_from_cache_file,
+                strict=self.strict,
+                enable_auto_mapping=not self.disable_auto_column_mapping)
             if self.remove_unused_columns:
                 dataset = RowPreprocessor.remove_useless_columns(dataset)
             datasets.append(dataset)
@@ -203,6 +214,13 @@ def init_self_cognition_preprocessor(
                      f"author: {kwargs['author']}.")
 
 
+def _inject_dataset_routing_tag(dataset: DATASET_TYPE, ds_name: str) -> DATASET_TYPE:
+    """Inject ``dataset`` column for multi-teacher routing (constant per source dataset)."""
+    if isinstance(dataset, HfIterableDataset):
+        return dataset.map(lambda example: {**example, 'dataset': ds_name})
+    return dataset.add_column('dataset', [ds_name] * len(dataset))
+
+
 def load_dataset(
     datasets: Union[List[str], str],
     *,
@@ -221,6 +239,7 @@ def load_dataset(
     download_mode: Literal['force_redownload', 'reuse_dataset_if_exists'] = 'reuse_dataset_if_exists',
     columns: Optional[Dict[str, str]] = None,  # columns_mapping
     remove_unused_columns: bool = True,
+    disable_auto_column_mapping: bool = False,
     # self-cognition
     model_name: Optional[Union[Tuple[str, str], List[str]]] = None,  # zh, en
     model_author: Optional[Union[Tuple[str, str], List[str]]] = None,
@@ -267,6 +286,9 @@ def load_dataset(
             names to target column names (e.g., {'text': 'content'}). Default: None.
         remove_unused_columns: Whether to remove columns not used in preprocessing.
             Helps reduce memory usage. Default: True.
+        disable_auto_column_mapping: By default, column names in the dataset are automatically
+            mapped. This parameter disables that behavior
+            (the `columns` parameter remains effective), defaulting to `False`.
         model_name: Model name for self-cognition task preprocessing. Can be a tuple of
             (Chinese_name, English_name) or list of names. Default: None.
         model_author: Model author for self-cognition task preprocessing. Can be a tuple of
@@ -297,16 +319,6 @@ def load_dataset(
         num_proc = None
     train_datasets = []
     val_datasets = []
-    loader = DatasetLoader(
-        num_proc=num_proc,
-        load_from_cache_file=load_from_cache_file,
-        streaming=streaming,
-        hub_token=hub_token,
-        strict=strict,
-        download_mode=download_mode,
-        columns=columns,  # columns_mapping
-        remove_unused_columns=remove_unused_columns,
-    )
 
     use_hf_default = use_hf
     if use_hf_default is None:
@@ -324,6 +336,17 @@ def load_dataset(
                 dataset_syntax.dataset = dataset_meta.hf_dataset_id if use_hf else dataset_meta.ms_dataset_id
         else:
             dataset_meta = dataset_syntax.get_dataset_meta(use_hf)
+        loader = dataset_meta.loader(
+            num_proc=num_proc,
+            load_from_cache_file=load_from_cache_file,
+            streaming=streaming,
+            hub_token=hub_token,
+            strict=strict,
+            download_mode=download_mode,
+            columns=columns,  # columns_mapping
+            remove_unused_columns=remove_unused_columns,
+            disable_auto_column_mapping=disable_auto_column_mapping,
+        )
         train_dataset = loader.load(dataset_syntax, dataset_meta, use_hf=use_hf)
         train_dataset, val_dataset = loader.post_process(
             train_dataset,
@@ -334,8 +357,13 @@ def load_dataset(
             random_state=seed,
         )
         if train_dataset is not None:
+            # Inject dataset_syntax.dataset as routing tag for multi-teacher
+            ds_name = dataset_syntax.dataset
+            train_dataset = _inject_dataset_routing_tag(train_dataset, ds_name)
             train_datasets.append(train_dataset)
         if val_dataset is not None:
+            ds_name = dataset_syntax.dataset
+            val_dataset = _inject_dataset_routing_tag(val_dataset, ds_name)
             val_datasets.append(val_dataset)
 
     if interleave_prob is None:

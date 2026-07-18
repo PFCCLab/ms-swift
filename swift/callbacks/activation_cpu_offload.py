@@ -5,23 +5,13 @@ from torch.distributed.fsdp import FSDPModule as FSDP2
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers.trainer_callback import TrainerControl, TrainerState
 from transformers.training_args import TrainingArguments
+from transformers.utils import is_torch_npu_available
 from typing import Any, Optional
 
 from swift.utils import get_logger
 from .base import TrainerCallback
 
 logger = get_logger()
-
-
-def is_torch_npu_available() -> bool:
-    """Check the availability of NPU"""
-    try:
-        if hasattr(torch, 'npu') and callable(getattr(torch.npu, 'is_available', None)):
-            return torch.npu.is_available()
-        return False
-    except ImportError:
-        return False
-
 
 is_cuda_available = torch.cuda.is_available()
 is_npu_available = is_torch_npu_available()
@@ -567,7 +557,7 @@ def enable_activation_offloading(model, strategy, enable_ckpt=False):
 
     get_layers(model)
     if len(layers) < 3:
-        logger.warning(f'Find only {len(layers)} fsdp layers, not neccessary to enable async activation offloading')
+        logger.warning(f'Find only {len(layers)} fsdp layers, not necessary to enable async activation offloading')
         return
 
     tensor_filter = FSDPParameterFilter()

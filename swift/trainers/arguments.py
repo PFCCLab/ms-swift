@@ -5,7 +5,7 @@ import platform
 from dataclasses import dataclass, field
 from transformers.training_args import TrainingArguments as HfTrainingArguments
 from transformers.training_args_seq2seq import Seq2SeqTrainingArguments as HfSeq2SeqTrainingArguments
-from typing import List, Literal, Optional, Union
+from typing import Dict, List, Literal, Optional, Union
 
 from swift.loss import loss_map
 from swift.utils import get_dist_setting, get_logger, is_liger_available, is_mp, json_parse_to_dict
@@ -77,7 +77,7 @@ class TrainArgumentsMixin:
         loss_type (Optional[str]): Custom loss_type name. Default is None, uses the model's built-in loss function.
             Available loss options can be found in `loss/mapping.py`
         metric (Optional[str]): Custom eval metric name. Default is None. Available eval_metric options can be found
-            in `eval_metric/mapping.py`.
+            in `metrics/mapping.py`.
         callbacks (List[str]): Custom trainer callbacks, default is `[]`. Available callbacks can be found
             in `callbacks/mapping.py`.
         early_stop_interval (Optional[int]): The interval for early stopping. Training will be terminated if the
@@ -135,6 +135,8 @@ class TrainArgumentsMixin:
     router_aux_loss_coef: float = 0.
     enable_dft_loss: bool = False  # https://arxiv.org/abs/2508.05629
     enable_channel_loss: bool = False
+    safe_serialization: bool = True
+    max_shard_size: str = '5GB'
 
     weight_decay: float = 0.1
     adam_beta2: float = 0.95
@@ -161,6 +163,10 @@ class TrainArgumentsMixin:
     # plugins
     optimizer: Optional[str] = None
     loss_type: Optional[str] = field(default=None, metadata={'help': f'loss_func choices: {list(loss_map.keys())}'})
+    # embedding (Matryoshka Representation Learning)
+    # Dict[int, float], where the key is the embedding dimension and the value is the corresponding loss weight,
+    # e.g. '{"32": 1.0, "64": 1.0, "128": 1.0}'.
+    mrl_dims: Optional[Union[dict, str]] = None
     eval_metric: Optional[str] = None
     callbacks: List[str] = field(default_factory=list)
     # early_step
@@ -255,6 +261,9 @@ class TrainArgumentsMixin:
             self.vit_gradient_checkpointing = self.gradient_checkpointing
         if self.gradient_checkpointing_kwargs:
             self.gradient_checkpointing_kwargs = json_parse_to_dict(self.gradient_checkpointing_kwargs)
+        if self.mrl_dims is not None:
+            self.mrl_dims = json_parse_to_dict(self.mrl_dims)
+            self.mrl_dims = {int(k): float(v) for k, v in self.mrl_dims.items()}
         self._init_liger()
         if self.dataloader_num_workers is None:
             if platform.system() == 'Windows':

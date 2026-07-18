@@ -9,6 +9,7 @@ from swift.utils import git_clone_github, safe_snapshot_download
 from ..constant import MLLMModelType
 from ..model_arch import ModelArch
 from ..model_meta import Model, ModelGroup, ModelMeta
+from ..patcher import patch_get_input_embeddings
 from ..register import ModelLoader, register_model
 
 
@@ -16,7 +17,7 @@ class LlavaLlamaHfLoader(ModelLoader):
 
     def get_config(self, model_dir: str):
         from transformers import LlavaConfig
-        self.autoconfig_class = LlavaConfig
+        self.auto_config_cls = LlavaConfig
         return super().get_config(model_dir)
 
     def get_model(self, model_dir: str, *args, **kwargs) -> PreTrainedModel:
@@ -429,7 +430,9 @@ class LlavaOnevisionLoader(ModelLoader):
         model_cls = get_class_from_dynamic_module(
             'modeling_llavaonevision1_5.LLaVAOneVision1_5_ForConditionalGeneration', model_dir)
         model_cls._no_split_modules = ['LLaVAOneVision1_5_DecoderLayer', 'RiceBlock']
-        return super().get_model(model_dir, *args, **kwargs)
+        model = super().get_model(model_dir, *args, **kwargs)
+        patch_get_input_embeddings(model.visual, 'patch_embed')
+        return model
 
 
 register_model(

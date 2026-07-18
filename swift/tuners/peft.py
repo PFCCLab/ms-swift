@@ -5,7 +5,7 @@ import os.path
 import peft
 import torch
 import torch.nn
-import transformers
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from functools import partial, reduce
 from modelscope import snapshot_download
@@ -15,7 +15,6 @@ from peft import (AdaLoraConfig, BOFTConfig, BOFTModel, LoftQConfig, LoHaConfig,
                   PromptEncoderConfig, PromptLearningConfig, PromptTuningConfig, VeraConfig, VeraModel, get_peft_config,
                   get_peft_model, get_peft_model_state_dict)
 from peft.config import PeftConfigMixin
-from peft.tuners import lora
 from peft.tuners.adalora import AdaLoraModel, RankAllocator
 from peft.tuners.lora import Embedding
 from transformers import Trainer as HfTrainer
@@ -84,6 +83,45 @@ class LoraConfig(peft.LoraConfig):
         return self
 
 
+@contextmanager
+def _patch_param_wrapper():
+    """Patch ParamWrapper.get_param for DeepSpeed ZeRO-3 compatibility.
+
+    When a parameter is NOT_AVAILABLE in ZeRO-3, param.data is a placeholder tensor
+    with wrong shape/ndim. All callers of get_param() only need metadata
+    (shape, ndim, dtype, device, requires_grad), so instead of gathering the full
+    parameter and cloning (O(N) memory), we use ds_shape + expand trick to create
+    a stride-0 tensor with correct metadata using O(1) memory.
+    """
+    try:
+        from peft.tuners.lora.layer import ParamWrapper
+    except ImportError:
+        yield
+        return
+    _get_param_origin = ParamWrapper.get_param
+
+    def _get_param_patched(self):
+        param = _get_param_origin(self)
+        if hasattr(param, 'ds_id'):
+            from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
+            if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
+                # ds_shape is always set by DeepSpeed for managed params
+                ds_shape = param.ds_shape
+                # Create a 1-element tensor then expand with stride-0: no real memory alloc
+                ones_shape = tuple(1 for _ in ds_shape)
+                fake = torch.empty(ones_shape, dtype=param.dtype, device=param.device)
+                if param.requires_grad and param.dtype.is_floating_point:
+                    fake.requires_grad_(True)
+                return fake.expand(ds_shape)
+        return param
+
+    ParamWrapper.get_param = _get_param_patched
+    try:
+        yield
+    finally:
+        ParamWrapper.get_param = _get_param_origin
+
+
 def _create_and_replace_hook(self, peft_config, adapter_name, target, *args, **kwargs):
     if target is None:
         return
@@ -91,7 +129,8 @@ def _create_and_replace_hook(self, peft_config, adapter_name, target, *args, **k
     if target.__class__.__name__ == 'NonDynamicallyQuantizableLinear':
         return
 
-    return self._create_and_replace_origin(peft_config, adapter_name, target, *args, **kwargs)
+    with _patch_param_wrapper():
+        return self._create_and_replace_origin(peft_config, adapter_name, target, *args, **kwargs)
 
 
 def _convert_dtype(target: torch.nn.Module, adapter_name: str, lora_dtype: str):
@@ -165,6 +204,19 @@ def create_optimizer_param_groups(self: PeftModel, **defaults):
         },
     ]
     return param_groups
+
+
+def load_adapter(self, model_id, *args, **kwargs):
+    load_result = self.load_adapter_origin(model_id, *args, **kwargs)
+    if load_result is None:
+        return load_result
+    # Avoid silent loading errors for LoRA trained with megatron-swift
+    unexpected_keys = [key for key in load_result.unexpected_keys if 'lora_' in key]
+    if unexpected_keys:
+        logger.warning_once(f'Unexpected LoRA keys found in checkpoint `{model_id}`, '
+                            f'len(unexpected_keys): {len(unexpected_keys)}, '
+                            f'unexpected_keys[:10]: {unexpected_keys[:10]}.')
+    return load_result
 
 
 def adalora_forward(self, *args, **kwargs):
@@ -290,9 +342,9 @@ def hot_patch_peft_module():
         BoneModel._create_and_replace = _create_and_replace_hook
 
     # Support type conversion
-    def __new_init__(self, model: torch.nn.Module, config: Dict[str, LoraConfig], adapter_name: str):
+    def __new_init__(self, model: torch.nn.Module, config: Dict[str, LoraConfig], *args, **kwargs):
 
-        self.__init_origin__(model, config, adapter_name)
+        self.__init_origin__(model, config, *args, **kwargs)
         active_adapters = self.active_adapter
         if isinstance(active_adapters, str):
             active_adapters = [active_adapters]
@@ -312,6 +364,8 @@ def hot_patch_peft_module():
 
     # Support LoRA+
     PeftModel.create_optimizer_param_groups = create_optimizer_param_groups
+    PeftModel.load_adapter_origin = PeftModel.load_adapter
+    PeftModel.load_adapter = load_adapter
 
     PeftConfigMixin.from_pretrained_origin = PeftConfigMixin.from_pretrained
     PeftConfigMixin.from_pretrained = LoraConfig.from_pretrained

@@ -4,19 +4,20 @@ import megatron.core
 import os
 import torch
 from dataclasses import dataclass, field, fields
+from mcore_bridge.model import get_mcore_model_type, get_model_meta
 from megatron.core import mpu
 from megatron.core.transformer.enums import AttnBackend
 from packaging import version
+from transformers.utils import is_torch_npu_available
 from transformers.utils.versions import require_version
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from swift.arguments import ModelArguments
-from swift.megatron.model import get_megatron_model_meta
 from swift.megatron.utils import initialize_megatron
 from swift.model import get_model_info_meta
 from swift.utils import get_dist_setting, get_logger, json_parse_to_dict
 
-mcore_015 = version.parse(megatron.core.__version__) >= version.parse('0.15.0rc0')
+mcore_016 = version.parse(megatron.core.__version__) >= version.parse('0.16.0rc0')
 logger = get_logger()
 
 
@@ -45,10 +46,26 @@ class RLHFMegatronArgumentsMixin:
     teacher_model: Optional[str] = field(default=None)
     teacher_model_type: Optional[str] = field(default=None)
     teacher_model_revision: Optional[str] = field(default=None)
+    _teacher_use_disable_adapter: bool = False
+    teacher_model_server: Optional[str] = field(
+        default=None,
+        metadata={
+            'help':
+            'URL of the teacher model server (e.g., http://localhost:8000). '
+            'When set, teacher logprobs are fetched via API instead of loading a local model. '
+            'Supports multi-teacher via JSON.'
+        })
+    teacher_tag_key: str = field(
+        default='dataset', metadata={'help': 'Column name for multi-teacher routing. Default "dataset".'})
+    gkd_logits_topk: Optional[int] = None
     lmbda: float = 0.5  # On-policy probability: with prob lmbda, use student-generated responses
-    seq_kd: bool = False  # Sequential KD: use teacher-generated responses when not on-policy
+    seq_kd: bool = False  # Deprecated
     offload_teacher_model: bool = False  # Offload teacher model to CPU to save GPU memory
     sft_alpha: float = 0.0  # Weight for SFT loss in GKD (0 = pure JSD, >0 = JSD + sft_alpha * SFT)
+
+    # OPD-RL (On-Policy Distillation as RL): a teacher (teacher_model / teacher_model_server)
+    # on a GRPO run turns it into OPD-RL, injecting teacher KL as the advantage.
+    teacher_kl_coef: float = 1.0
 
     # grpo/gkd
     temperature: float = 0.9  # Temperature for sampling and loss computation
@@ -67,14 +84,24 @@ class RLHFMegatronArgumentsMixin:
     tau_pos: float = 1.0
     tau_neg: float = 1.05
 
+    # REAL https://arxiv.org/abs/2602.05630
+    real_tau: float = 0.5
+
+    # FIPO https://arxiv.org/abs/2603.19835
+    fipo_decay_rate: float = 32.0
+    fipo_clip_range: Optional[float] = 0.2
+    fipo_clip_high_only: bool = True
+    fipo_safety_threshold: Optional[float] = 4.0
+
     epsilon: float = 0.2
     epsilon_high: Optional[float] = None
     delta: Optional[float] = None
-    top_k: int = 50
-    top_p: float = 0.9
+    top_k: int = -1
+    top_p: float = 1.0
     repetition_penalty: float = 1.
 
     use_vllm: bool = True
+    use_ray: bool = False
     vllm_mode: Optional[Literal['server', 'colocate']] = None
 
     vllm_enable_prefix_caching: bool = True
@@ -86,7 +113,8 @@ class RLHFMegatronArgumentsMixin:
     vllm_disable_cascade_attn: bool = False
     vllm_max_num_seqs: Optional[int] = None
     vllm_mm_processor_cache_gb: Optional[float] = None
-    vllm_engine_kwargs: Optional[Dict[str, Any]] = None
+    vllm_engine_kwargs: Optional[Union[dict, str]] = None
+    vllm_enable_lora: bool = False
 
     sleep_level: Literal[0, 1, 2] = 0
     offload_optimizer: bool = False
@@ -145,6 +173,8 @@ class RLHFMegatronArgumentsMixin:
     # Beyond the 80/20 Rule, https://arxiv.org/abs/2506.01939
     top_entropy_quantile: float = 1.0
 
+    router_replay_mode: Literal['disabled', 'R2', 'R3'] = 'disabled'
+
     # ───────────────────────────  Not Supported Yet  ───────────────────────────
 
     # reward model
@@ -164,6 +194,8 @@ class RLHFMegatronArgumentsMixin:
     max_turns: Optional[int] = None
     completion_length_limit_scope: Literal['total', 'per_round'] = 'per_round'
     vllm_server_pass_dataset: bool = False
+    use_gym_env: Optional[bool] = None
+    gym_env: Optional[str] = None
 
     num_iterations: int = 1
 
@@ -189,11 +221,174 @@ class RLHFMegatronArgumentsMixin:
         if self.rlhf_type == 'kto':
             self._init_kto()
         if self.rlhf_type == 'grpo':
-            assert self.vllm_mode is not None, 'vllm_mode is required for Megatron GRPO'
             self._init_grpo()
+            if self.cosine_max_len is None:
+                self.cosine_max_len = self.max_completion_length
             if self.vllm_limit_mm_per_prompt is not None:
                 self.vllm_limit_mm_per_prompt = json_parse_to_dict(self.vllm_limit_mm_per_prompt)
+        # Teacher setup is identical for GKD and GRPO (OPD-RL): a teacher_model / server /
+        # same-model LoRA self-distillation all flow through the same detection. GKD also
+        # allows dynamic self-distillation (no teacher at all); GRPO without a teacher is
+        # plain RL, so only resolve a teacher for GRPO when one is configured.
+        if self.rlhf_type == 'gkd' or (self.rlhf_type == 'grpo' and
+                                       (self.teacher_model is not None or self.teacher_model_server is not None)):
+            self._check_teacher()
+            if self.rlhf_type == 'grpo':
+                self._check_opd_rl()
+        if self.rlhf_type == 'gkd':
+            # GKD-specific: the API path only returns top-k logprobs, so gkd_logits_topk is required.
+            if self.teacher_model_server is not None and self.gkd_logits_topk is None:
+                raise ValueError('gkd_logits_topk is required when using teacher_model_server')
+
+            # Validate gkd_logits_topk
+            if self.gkd_logits_topk is not None and self.gkd_logits_topk <= 0:
+                raise ValueError(f'gkd_logits_topk must be a positive integer, got {self.gkd_logits_topk}')
+
+            # seq_kd (teacher-generated responses) is not implemented; raise early.
+            if self.seq_kd:
+                raise NotImplementedError('seq_kd=True (Sequential KD with teacher generation) is not supported.')
+
+            self.num_generations = 1
+            self._init_generation_batch_params()
+
+        if self.rlhf_type in ['grpo', 'gkd']:
             self.vllm_engine_kwargs = json_parse_to_dict(self.vllm_engine_kwargs)
+            if self.use_vllm and os.getenv('SWIFT_AUDIO_LOAD_BACKEND') is None:
+                # align with vLLM audio load backend
+                os.environ['SWIFT_AUDIO_LOAD_BACKEND'] = 'soundfile_pyav'
+
+    @staticmethod
+    def resolve_generation_batch_size(
+        generation_batch_size: Optional[int],
+        steps_per_generation: Optional[int],
+        global_batch_size: int,
+        num_generations: int,
+    ) -> Tuple[int, int]:
+        """Resolve generation_batch_size and steps_per_generation from user inputs.
+
+        Returns (generation_batch_size, steps_per_generation).
+        """
+        if generation_batch_size is None and steps_per_generation is None:
+            steps_per_generation = 1
+            generation_batch_size = global_batch_size * steps_per_generation
+        elif generation_batch_size is not None and steps_per_generation is not None:
+            expected = global_batch_size * steps_per_generation
+            if generation_batch_size != expected:
+                raise ValueError(f'generation_batch_size ({generation_batch_size}) must equal '
+                                 f'global_batch_size ({global_batch_size}) * steps_per_generation '
+                                 f'({steps_per_generation}) = {expected}.')
+        elif generation_batch_size is not None:
+            if generation_batch_size % global_batch_size != 0:
+                raise ValueError(f'generation_batch_size ({generation_batch_size}) '
+                                 f'must be divisible by global_batch_size ({global_batch_size})')
+            steps_per_generation = generation_batch_size // global_batch_size
+        else:
+            generation_batch_size = global_batch_size * steps_per_generation
+
+        if steps_per_generation <= 0:
+            raise ValueError(f'steps_per_generation must be > 0, got {steps_per_generation}.')
+
+        if num_generations > 1 and generation_batch_size % num_generations != 0:
+            raise ValueError(f'generation_batch_size ({generation_batch_size}) must be divisible by '
+                             f'num_generations ({num_generations}).')
+
+        return generation_batch_size, steps_per_generation
+
+    @staticmethod
+    def validate_batch_dp_alignment(
+        generation_batch_size: int,
+        num_generations: int,
+        dp_size: int,
+        micro_batch_size: int,
+        world_size: int,
+    ) -> None:
+        """Validate that batch parameters are correctly aligned with DP parallelism.
+
+        Reusable across both worker-side (torch.distributed) and pipeline-side
+        (Ray config-based dp estimation) contexts.
+        """
+        num_rollout_prompt = generation_batch_size // num_generations
+        if num_rollout_prompt % dp_size != 0:
+            raise ValueError(f'num_rollout_prompt ({num_rollout_prompt}) = generation_batch_size '
+                             f'({generation_batch_size}) // num_generations ({num_generations}) '
+                             f'must be divisible by dp_size ({dp_size}).')
+
+        per_device_num_rollout_prompt = num_rollout_prompt // dp_size
+        if per_device_num_rollout_prompt < 1:
+            raise ValueError(f'per_device_num_rollout_prompt ({per_device_num_rollout_prompt}) must be >= 1, '
+                             f'please adjust generation_batch_size/steps_per_generation/num_generations.')
+
+        if per_device_num_rollout_prompt % micro_batch_size != 0:
+            raise ValueError(f'Per-device rollout prompt count ({per_device_num_rollout_prompt}) = '
+                             f'(generation_batch_size ({generation_batch_size}) // '
+                             f'num_generations ({num_generations})) // dp_size ({dp_size}) '
+                             f'must be divisible by micro_batch_size ({micro_batch_size}).')
+
+        per_device_generation_batch_size = generation_batch_size // world_size
+        if per_device_generation_batch_size < 1:
+            raise ValueError(f'per_device_generation_batch_size ({per_device_generation_batch_size}) must be >= 1.')
+
+    def _init_generation_batch_params(self):
+        self.generation_batch_size, self.steps_per_generation = self.resolve_generation_batch_size(
+            self.generation_batch_size, self.steps_per_generation, self.global_batch_size, self.num_generations)
+
+        if torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+            dp_size = world_size // (
+                self.pipeline_model_parallel_size * self.tensor_model_parallel_size * self.context_parallel_size)
+            self.validate_batch_dp_alignment(self.generation_batch_size, self.num_generations, dp_size,
+                                             self.micro_batch_size, world_size)
+            self.per_device_generation_batch_size = self.generation_batch_size // world_size
+
+    def _check_teacher(self):
+        """Resolve the teacher (shared by GKD and GRPO/OPD-RL).
+
+        Detects the three teacher modes and sets ``_teacher_use_disable_adapter``:
+          - separate teacher_model / teacher_model_server,
+          - same-model LoRA self-distillation (disable_adapter, no extra model),
+          - dynamic self-distillation (no teacher -> teacher == current student weights).
+        """
+        if self.teacher_model is not None and self.teacher_model_server is not None:
+            raise ValueError('setting both `teacher_model` and `teacher_model_server` is not supported.')
+
+        # Fail fast: the Ray pipeline only supports a colocated teacher_model (see
+        # swift/ray/megatron/grpo_trainer.py), so reject teacher_model_server at parse time.
+        if self.use_ray and self.teacher_model_server is not None:
+            raise ValueError('teacher_model_server is not supported with use_ray')
+
+        # Validate teacher_model_server: accept single URL or JSON multi-teacher config.
+        if self.teacher_model_server is not None:
+            from swift.rlhf_trainers.gkd_helpers import parse_teacher_model_server
+            parse_teacher_model_server(self.teacher_model_server)
+
+        self._teacher_use_disable_adapter = False
+        if self.teacher_model is not None and self.teacher_model == self.model:
+            if self.tuner_type == 'lora':
+                logger.info('LoRA + same teacher_model: using disable_adapter() for fixed teacher (no extra model).')
+                self._teacher_use_disable_adapter = True
+                self.teacher_model = None
+                self.teacher_model_dir = None
+            # Full training + same teacher_model: a separate frozen copy is loaded as the fixed teacher.
+
+    def _check_opd_rl(self):
+        """Fail-fast OPD-RL (teacher distillation on Megatron GRPO) parameter compatibility.
+
+        Mirrors ``RLHFArguments._check_opd_rl``: the teacher signal is a *per-token* advantage, so
+        features that need a *per-sequence* advantage (sign-based) or reward variance are rejected.
+        Called after ``_init_grpo`` so ``loss_type`` / ``scale_rewards`` are already resolved.
+        """
+        if self.loss_type in ['real', 'fipo']:
+            raise ValueError(f'OPD-RL (teacher) does not support loss_type={self.loss_type!r} '
+                             '(it needs a per-sequence advantage). Use grpo/bnpo/dr_grpo/dapo/cispo/sapo.')
+        if self.off_policy_sequence_mask_delta is not None:
+            raise ValueError('OPD-RL (teacher) does not support off_policy_sequence_mask_delta '
+                             '(it needs a per-sequence advantage).')
+        if not self.reward_funcs:
+            if self.dynamic_sample:
+                raise ValueError('dynamic_sample requires reward_funcs (it filters groups by reward std); '
+                                 'pure OPD-RL distillation has no reward variance.')
+            if self.scale_rewards == 'gdpo':
+                raise ValueError("scale_rewards='gdpo' requires reward_funcs; pure OPD-RL distillation has none.")
 
     def _init_grpo(self):
 
@@ -202,62 +397,18 @@ class RLHFMegatronArgumentsMixin:
                 raise ValueError('async_generate is not supported for Megatron GRPO right now')
             if self.sync_ref_model:
                 raise ValueError('sync_ref_model is not supported for Megatron GRPO right now')
-            if not self.dataset_shuffle:
-                raise ValueError('dataset_shuffle false is not supported for Megatron GRPO')
-            if self.multi_turn_scheduler:
-                raise ValueError('multi_turn_scheduler is not supported for Megatron GRPO right now')
             if self.num_iterations > 1:
                 raise ValueError('num_iterations > 1 is not supported for Megatron GRPO right now')
 
-        def _check_batch_params():
-            # Set default values if both are None
-            if self.generation_batch_size is None and self.steps_per_generation is None:
-                self.steps_per_generation = 1
-                self.generation_batch_size = self.global_batch_size * self.steps_per_generation
-            # Both configured - error
-            elif self.generation_batch_size is not None and self.steps_per_generation is not None:
-                raise ValueError("'generation_batch_size' and 'steps_per_generation' cannot be both configured")
-            # Only generation_batch_size configured
-            elif self.generation_batch_size is not None:
-                if self.generation_batch_size % self.global_batch_size != 0:
-                    raise ValueError(f'generation_batch_size ({self.generation_batch_size}) '
-                                     f'must be divisible by global_batch_size ({self.global_batch_size})')
-                self.steps_per_generation = self.generation_batch_size // self.global_batch_size
-            # Only steps_per_generation configured
-            else:
-                self.generation_batch_size = self.global_batch_size * self.steps_per_generation
-
-            world_size = torch.distributed.get_world_size()
-            dp_size = world_size // (
-                self.pipeline_model_parallel_size * self.tensor_model_parallel_size * self.context_parallel_size)
-            num_rollout_prompt = self.generation_batch_size // self.num_generations
-            if num_rollout_prompt % dp_size != 0:
-                raise ValueError(f'num_rollout_prompt ({num_rollout_prompt}) = generation_batch_size '
-                                 f'({self.generation_batch_size}) // num_generations ({self.num_generations}) '
-                                 f'must be divisible by dp_size ({dp_size}). '
-                                 f'Please adjust generation_batch_size/steps_per_generation/num_generations.')
-
-            per_device_num_rollout_prompt = num_rollout_prompt // dp_size
-            assert per_device_num_rollout_prompt >= 1, \
-                (f'per_device_num_rollout_prompt ({per_device_num_rollout_prompt}) must be greater than 1, '
-                 f'please adjust generation_batch_size/steps_per_generation/num_generations to make it greater than 1')
-
-            if per_device_num_rollout_prompt % self.micro_batch_size != 0:
-                raise ValueError(f'Per-device rollout prompt count ({per_device_num_rollout_prompt}) = '
-                                 f'(generation_batch_size ({self.generation_batch_size}) // '
-                                 f'num_generations ({self.num_generations})) // dp_size ({dp_size}) '
-                                 f'must be divisible by micro_batch_size ({self.micro_batch_size}). '
-                                 f'Please adjust arguments to satisfy: '
-                                 f'(generation_batch_size // num_generations) // dp_size % '
-                                 f'micro_batch_size == 0')
-
-            self.per_device_generation_batch_size = self.generation_batch_size // world_size
-            assert self.per_device_generation_batch_size >= 1, \
-                (f'per_device_generation_batch_size ({self.per_device_generation_batch_size}) must be greater than 1, '
-                 f'please adjust generation_batch_size/steps_per_generation/num_generations to make it greater than 1')
+            if self.loss_type == 'real':
+                assert self.micro_batch_size % self.num_generations == 0, \
+                    (f'"REAL loss requires that the training micro_batch_size ({self.micro_batch_size}) '
+                     f'is a multiple of num_generations ({self.num_generations}). Please adjust your batch parameters.')
 
         _check_not_supported()
-        _check_batch_params()
+        if self.dataset_shuffle is not None:
+            self.train_dataloader_shuffle = self.dataset_shuffle
+        self._init_generation_batch_params()
         self.remove_unused_columns = False
         logger.info(f'Setting args.remove_unused_columns: {self.remove_unused_columns}')
         if self.truncation_strategy is None:
@@ -265,6 +416,13 @@ class RLHFMegatronArgumentsMixin:
         if self.truncation_strategy not in {'left', 'delete'}:
             raise ValueError("GRPO requires `truncation_strategy 'left' or 'delete'`, "
                              f"Current value: `truncation_strategy='{self.truncation_strategy}'`.")
+        # disable normalization, REAL https://arxiv.org/abs/2602.05630
+        if self.loss_type == 'real':
+            self.scale_rewards = 'none'
+            logger.warning(
+                f"[REAL] scale_rewards='{self.scale_rewards}' is ignored. "
+                "It will be forced to 'none' because 'loss_type = real' does not support reward normalization.")
+
         if self.beta is None:
             self.beta = 0.04  # https://arxiv.org/abs/2402.03300
         if self.async_generate:
@@ -278,13 +436,17 @@ class RLHFMegatronArgumentsMixin:
             if self.soft_max_length is None:
                 self.soft_max_length = self.max_completion_length
                 logger.info(f'Auto-configured soft_max_length = max_completion_length {self.max_completion_length}')
-        assert self.use_vllm, 'use_vllm must be True for Megatron GRPO'
+        if not self.use_ray:
+            assert self.use_vllm, 'use_vllm must be True for Megatron GRPO'
+
+        # Mirror deploy_args: gym_env implies use_gym_env unless the user said otherwise.
+        if self.use_gym_env is None and self.gym_env is not None:
+            self.use_gym_env = True
 
 
 @dataclass
 class MegatronTunerMixin:
-    tuner_type: Literal['lora', 'full'] = 'full'
-    train_type: Optional[Literal['lora', 'full']] = None  # compat swift3.x
+    tuner_type: Literal['lora', 'full', 'lora_llm'] = 'full'
     freeze_llm: bool = False
     freeze_vit: bool = True
     freeze_aligner: bool = True
@@ -308,9 +470,6 @@ class MegatronTunerMixin:
     use_rslora: bool = False
 
     def __post_init__(self):
-        if self.train_type is not None:
-            logger.warning('`train_type` is deprecated, please use `tuner_type` instead.')
-            self.tuner_type = self.train_type
         if 0 < self.freeze_parameters_ratio < 1 and self.pipeline_model_parallel_size > 1:
             raise ValueError('`freeze_parameters_ratio` is not supported when `pipeline_model_parallel_size` > 1')
         if self.target_regex:
@@ -338,9 +497,10 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     cross_entropy_fusion_impl: Literal['native', 'te'] = 'native'
     calculate_per_token_loss: Optional[bool] = None
     attention_backend: str = 'flash'  # flash, fused, unfused, local, auto
-    optimizer: Literal['adam', 'sgd'] = 'adam'
+    optimizer: Literal['adam', 'sgd', 'muon', 'dist_muon'] = 'adam'
     optimizer_cpu_offload: bool = False
     optimizer_offload_fraction: float = 1.
+    optimizer_cuda_graph: bool = False
     use_precision_aware_optimizer: bool = False
     # Master switch for PaddleFleet<->Megatron bit-alignment patches contributed by
     # ningzhengsheng in ms-swift and Megatron-LM. When True the patched (accuracy-aligned)
@@ -361,7 +521,7 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     train_dataloader_shuffle: bool = True
     dataloader_num_workers: int = 4
     dataloader_pin_memory: bool = True
-    dataloader_persistent_workers: bool = True
+    dataloader_persistent_workers: bool = False
     dataloader_prefetch_factor: int = 2
     data_sharding: bool = False
     group_by_length: bool = False
@@ -393,6 +553,16 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     adam_beta2: float = 0.95
     adam_eps: float = 1e-8
     sgd_momentum: float = 0.9
+    muon_momentum: float = 0.9
+    muon_split_qkv: bool = True
+    muon_use_nesterov: bool = False
+    muon_scale_mode: Literal['spectral', 'unit_rms_norm', 'shape_scaling'] = 'spectral'
+    muon_fp32_matmul_prec: Literal['low', 'medium', 'high'] = 'medium'
+    muon_coefficient_type: str = 'quintic'
+    muon_num_ns_steps: int = 5
+    muon_tp_mode: Literal['blockwise', 'duplicated', 'distributed'] = 'blockwise'
+    muon_extra_scale_factor: float = 1.
+    muon_scalar_optimizer: str = 'adam'
 
     # checkpoint
     output_dir: Optional[str] = None
@@ -428,6 +598,7 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     account_for_embedding_in_pipeline_split: bool = False
     account_for_loss_in_pipeline_split: bool = False
     overlap_p2p_comm: bool = True
+    batch_p2p_comm: Optional[bool] = None
     align_param_gather: bool = True
 
     sequence_parallel: bool = False
@@ -437,6 +608,9 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     overlap_param_gather: bool = False
     overlap_param_gather_with_optimizer_step: bool = False
     align_grad_reduce: bool = True
+    # Eagerly create NCCL communicators before the training loop to avoid the lazy
+    # first-use allocation hitting the iteration-1 memory peak (Failed to CUDA calloc async).
+    nccl_comm_warmup: bool = False
     virtual_pipeline_model_parallel_size: Optional[int] = None
     microbatch_group_size_per_vp_stage: Optional[int] = None
     pipeline_model_parallel_layout: Optional[str] = None
@@ -460,9 +634,14 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     # fp8
     fp8_format: Literal['e4m3', 'hybrid'] = None
     fp8_recipe: Literal['tensorwise', 'delayed', 'mxfp8', 'blockwise'] = 'delayed'
+    fp8_param_gather: bool = False
     fp8_amax_history_len: int = 1024
     fp8_amax_compute_algo: Literal['most_recent', 'max'] = 'max'
-    fp8_param_gather: bool = False
+
+    # fp4
+    fp4_format: Literal['e2m1'] = None
+    fp4_recipe: Literal['nvfp4'] = 'nvfp4'
+    fp4_param_gather: bool = False
 
     # mixed precision
     fp16: Optional[bool] = None
@@ -478,7 +657,7 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     moe_enable_deepep: bool = False
     moe_grouped_gemm: bool = True
     moe_permute_fusion: bool = False
-    moe_aux_loss_coeff: float = 0.
+    moe_aux_loss_coeff: List[float] = 0.
     moe_z_loss_coeff: Optional[float] = None
     moe_shared_expert_overlap: bool = False
     moe_layer_recompute: bool = False  # compat mcore 0.12
@@ -489,6 +668,8 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     # mtp
     mtp_num_layers: Optional[int] = None
     mtp_loss_scaling_factor: float = 0.1
+    mtp_decoder_input_detach: bool = False
+    mtp_shared_weights: bool = False
 
     # mcore-bridge
     model: Optional[str] = None
@@ -506,22 +687,38 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
 
     # visual
     vit_gradient_checkpointing: Optional[bool] = None
+    vit_gradient_checkpointing_kwargs: Optional[Union[dict, str]] = None
+    vit_attn_impl: Optional[str] = None
     vit_lr: Optional[float] = None
     aligner_lr: Optional[float] = None
-    attn_impl: Optional[str] = None
-    gradient_checkpointing_kwargs: Optional[Union[dict, str]] = None
+
+    # dsa
+    dsa_indexer_loss_coeff: float = 0.
+    dsa_indexer_use_sparse_loss: bool = False
+    apply_dsa_kernel_fusion: bool = False
+    # deepseek-v4
+    csa_dense_mode: bool = False
+    use_fused_mhc: bool = False
+    mhc_recompute_layer_num: Optional[int] = None
 
     # other
+    megatron_extra_kwargs: Optional[Union[dict, str]] = None
+    language_model_only: bool = False
     check_model: bool = True
     torch_dtype: Optional[Union[torch.dtype, str]] = None
     rope_scaling: Optional[Union[dict, str]] = None
     apply_wd_to_qk_layernorm: bool = False
+    linear_decoupled_in_proj: bool = False
 
     enable_dft_loss: bool = False
     enable_channel_loss: bool = False
     task_type: Literal['causal_lm', 'seq_cls', 'embedding', 'generative_reranker'] = None
     num_labels: Optional[int] = None
     problem_type: Literal['regression', 'single_label_classification', 'multi_label_classification'] = None
+    # embedding (Matryoshka Representation Learning)
+    # Dict[int, float], where the key is the embedding dimension and the value is the corresponding loss weight,
+    # e.g. '{"32": 1.0, "64": 1.0, "128": 1.0}'.
+    mrl_dims: Optional[Union[dict, str]] = None
     save_strategy: Literal['steps', 'epoch'] = 'steps'
     callbacks: List[str] = field(default_factory=list)
 
@@ -541,13 +738,11 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
                 if old_value is not None:
                     res[key] = old_value
             res.pop('mcore_adapter', None)
-            if res['tuner_type'] != 'lora':
+            if res['tuner_type'] == 'full':
                 res.pop('mcore_model', None)
         return res
 
     def _set_default(self):
-        if self.mlp_padding_free and (self.sequence_parallel or self.context_parallel_size > 1):
-            raise ValueError('mlp_padding_free is not compatible with sequence parallel or context parallel.')
         if self.local_rank is None:
             self.local_rank = get_dist_setting()[1]
         if self.lr is None:
@@ -567,9 +762,16 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
         if self.apply_query_key_layer_scaling:
             os.environ['NVTE_APPLY_QK_LAYER_SCALING'] = '1'
 
+    def _check_mcore_bridge(self):
+        if self.language_model_only:
+            require_version('mcore-bridge>=1.4.3', 'Please install "mcore-bridge>=1.4.3" to use language_model_only.')
+            if self.tuner_type == 'lora_llm':
+                raise ValueError('`tuner_type="lora_llm"` is not supported when `language_model_only=True`. '
+                                 'Please use `tuner_type="lora"` instead.')
+
     def __post_init__(self):
-        if self.tuner_type == 'lora':
-            require_version('peft>=0.15')
+        if self.tuner_type != 'full':
+            require_version('peft>=0.15', 'Please install peft>=0.15 to use LoRA in Megatron-SWIFT.')
         RLHFMegatronArgumentsMixin.__post_init__(self)
         MegatronTunerMixin.__post_init__(self)
         os.environ.setdefault('CUDA_DEVICE_MAX_CONNECTIONS', '1')
@@ -593,11 +795,16 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
                     dummy_meta.suffix = []
             except Exception as e:  # pragma: no cover - defensive, never block startup
                 logger.warning(f'Failed to sync dummy template suffix for use_accuracy_compatible: {e}')
+
+        self._check_mcore_bridge()
+
         if self.recompute_granularity == 'none':
             self.recompute_granularity = None
         if self.recompute_granularity == 'selective' and self.recompute_method is not None:
             raise ValueError('recompute method is not yet supported for selective recomputing granularity')
 
+        if self.group_by_length and self.padding_free:
+            raise ValueError('group_by_length is not compatible with padding_free.')
         self._set_default()
         self._init_vpp_size()
         if self.vit_gradient_checkpointing is None:
@@ -611,21 +818,29 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
         self.model_type = self.model_info.model_type
         self.model_dir = self.model_info.model_dir
         self.is_multimodal = self.model_meta.is_multimodal
-        self.megatron_model_meta = get_megatron_model_meta(self.model_type)
+        self.megatron_model_meta = get_model_meta(self._get_mcore_model_type(self.model_meta))
         if self.megatron_model_meta is None:
             raise ValueError(f'Model: {self.model} is not supported.')
         self._init_teacher_model()
-        if self.apply_wd_to_qk_layernorm and self.model_type not in {'qwen3_next', 'qwen3_5'}:
-            raise ValueError('apply_wd_to_qk_layernorm is only supported for qwen3_next and qwen3_5')
+        if self.apply_wd_to_qk_layernorm and self.model_type not in {'qwen3_next', 'qwen3_5', 'qwen3_5_moe'}:
+            raise ValueError('apply_wd_to_qk_layernorm is only supported for qwen3_next, qwen3_5 and qwen3_5_moe')
         if self.pipeline_model_parallel_size == 1 and (self.decoder_first_pipeline_num_layers is not None
                                                        or self.decoder_last_pipeline_num_layers is not None):
             raise ValueError('pipeline_model_parallel_size must be greater than 1 if you want to set '
                              'decoder_first_pipeline_num_layers or decoder_last_pipeline_num_layers.')
-        self.fp8 = self.fp8_format  # compat megatron-lm
+        # compat megatron-core
+        self.fp8 = self.fp8_format
+        self.fp4 = self.fp4_format
+
+        if self.megatron_extra_kwargs is not None:
+            self.megatron_extra_kwargs = json_parse_to_dict(self.megatron_extra_kwargs)
+        if self.mrl_dims is not None:
+            self.mrl_dims = json_parse_to_dict(self.mrl_dims)
+            self.mrl_dims = {int(k): float(v) for k, v in self.mrl_dims.items()}
         if self.task_type not in {'causal_lm', 'generative_reranker'}:
             self.untie_embeddings_and_output_weights = True
-        if self.gradient_checkpointing_kwargs is not None:
-            self.gradient_checkpointing_kwargs = json_parse_to_dict(self.gradient_checkpointing_kwargs)
+        if self.vit_gradient_checkpointing_kwargs is not None:
+            self.vit_gradient_checkpointing_kwargs = json_parse_to_dict(self.vit_gradient_checkpointing_kwargs)
         if self.gradient_accumulation_fusion:
             try:
                 import apex
@@ -649,6 +864,13 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
             self.eval_steps = self.save_steps
         if self.merge_lora is None:
             self.merge_lora = self.save_safetensors
+        if self.tuner_type == 'lora_llm':
+            if not self.is_multimodal:
+                raise ValueError('`tuner_type="lora_llm"` is only supported for multimodal models.')
+            if not self.merge_lora:
+                raise ValueError('`merge_lora` must be True when using `--tuner_type lora_llm`')
+            if not self.no_save_optim:
+                raise ValueError('`no_save_optim` must be True when using `--tuner_type lora_llm`')
         if self.adapters or self.ref_adapters or self.mcore_adapter or self.mcore_ref_adapter:
             if self.tuner_type == 'full':
                 self.tuner_type = 'lora'
@@ -659,25 +881,82 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
         self._init_multimodal_full()
         self._map_dtype()
         self._init_weigh_decay()
-        self.attention_backend = AttnBackend[self.attention_backend]
+        self._init_attention_backend()
         if self.sequence_parallel and self.tensor_model_parallel_size <= 1:
             self.sequence_parallel = False
+        if isinstance(self.moe_aux_loss_coeff, list) and len(self.moe_aux_loss_coeff) == 1:
+            self.moe_aux_loss_coeff = self.moe_aux_loss_coeff[0]
+        if isinstance(self.moe_router_load_balancing_type, list) and len(self.moe_router_load_balancing_type) == 1:
+            self.moe_router_load_balancing_type = self.moe_router_load_balancing_type[0]
         if self.tp_comm_overlap and not self.sequence_parallel:
             raise ValueError('Tensor parallel communication/GEMM overlap can happen only when '
                              'sequence parallelism is enabled')
 
+        self._init_distributed()
+        self._check_muon()
+
+    def _init_attention_backend(self):
+        if self.attention_backend.startswith('flash_'):
+            from transformer_engine.pytorch.attention.dot_product_attention.utils import FlashAttentionUtils as fa_utils
+
+            fa_version = int(self.attention_backend[len('flash_'):])
+            assert fa_version in (2, 3, 4), (f'Unsupported flash attention version: {fa_version}. '
+                                             f'Supported: flash_2, flash_3, flash_4.')
+            available = {2: fa_utils.is_installed, 3: fa_utils.v3_is_installed, 4: fa_utils.v4_is_installed}
+            if not available[fa_version]:
+                raise ValueError(f'flash-attn v{fa_version} is not installed. '
+                                 f'Detected installations: FA2={available[2]}, FA3={available[3]}, FA4={available[4]}.')
+
+            if fa_version != 2:
+                fa_utils.is_installed = False
+            if fa_version != 3:
+                fa_utils.v3_is_installed = False
+            if fa_version != 4:
+                fa_utils.v4_is_installed = False
+            logger.info(f'Forcing Flash Attention v{fa_version} as the attention backend.')
+            self.attention_backend = 'flash'
+        self.attention_backend = AttnBackend[self.attention_backend]
+
+    def _init_distributed(self):
         initialize_megatron(self)
         total_model_size = (
             self.tensor_model_parallel_size * self.pipeline_model_parallel_size * self.context_parallel_size)
         # world_size is initialized in initialize_megatron
         self.data_parallel_size = self.world_size // total_model_size
         # Gradient Accumulation
-        self.num_microbatches = self.global_batch_size // self.data_parallel_size // self.micro_batch_size
+        micro_batch_times_data_parallel_size = self.micro_batch_size * self.data_parallel_size
+        if self.global_batch_size % micro_batch_times_data_parallel_size != 0:
+            raise ValueError(f'global batch size ({self.global_batch_size}) is not divisible by micro batch size '
+                             f'({self.micro_batch_size}) times data parallel size ({self.data_parallel_size}).')
+        self.num_microbatches = self.global_batch_size // micro_batch_times_data_parallel_size
         if self.num_microbatches == 0:
             raise ValueError('global_batch_size must be >= `data_parallel_size * micro_batch_size` '
                              f'to have at least one micro-batch. global_batch_size: {self.global_batch_size}, '
                              f'data_parallel_size: {self.data_parallel_size}, '
                              f'micro_batch_size: {self.micro_batch_size}.')
+
+    def _get_mcore_model_type(self, model_meta):
+        model_type = model_meta.model_type
+        mcore_model_type = self.model_meta.mcore_model_type
+        if mcore_model_type is None:
+            mcore_model_type = get_mcore_model_type(model_type)
+        return mcore_model_type
+
+    def _check_muon(self):
+        # Code borrowed from NVIDIA/Megatron-LM
+        if 'muon' in self.optimizer:
+            if not mcore_016:
+                raise ValueError('Muon optimizer requires "megatron-core>=0.16".')
+
+            if self.optimizer == 'muon':
+                assert not self.overlap_grad_reduce, (
+                    'Muon optimizer does not support overlap grad reduce. Use dist_muon instead.')
+                assert not self.overlap_param_gather, (
+                    'Muon optimizer does not support overlap param gather. Use dist_muon instead.')
+            # Muon optimizer does not support distributed optimizer for now.
+            self.use_distributed_optimizer = False
+            # compat mcore 0.17
+            self.muon_nesterov = self.muon_use_nesterov
 
     def _init_teacher_model(self):
         if self.teacher_model is None:
@@ -686,7 +965,7 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
             self.teacher_model, model_type=self.teacher_model_type, use_hf=self.use_hf, hub_token=self.hub_token)
         self.teacher_model_type = self.teacher_model_info.model_type
         self.teacher_model_dir = self.teacher_model_info.model_dir
-        self.teacher_megatron_model_meta = get_megatron_model_meta(self.teacher_model_type)
+        self.teacher_megatron_model_meta = get_model_meta(self._get_mcore_model_type(self.teacher_model_meta))
         if self.teacher_megatron_model_meta is None:
             raise ValueError(f'Model: {self.teacher_model} is not supported.')
 
@@ -709,6 +988,8 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
         if self.virtual_pipeline_model_parallel_size is None:
             self.overlap_p2p_comm = False
             self.align_param_gather = False
+        if self.batch_p2p_comm is None:
+            self.batch_p2p_comm = not self.overlap_p2p_comm
 
     def _load_adapter_config(self):
         assert len(self.adapters) == 1, 'Currently only support one adapter'
@@ -716,7 +997,7 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
         adapter_config_path = os.path.join(adapter_path, 'adapter_config.json')
         adapter_config = {}
         if os.path.exists(adapter_config_path):
-            with open(adapter_config_path, 'r') as f:
+            with open(adapter_config_path, 'r', encoding='utf-8') as f:
                 adapter_config = json.load(f)
         mapping = {'r': 'lora_rank', 'bias': 'lora_bias'}
         for k in ['lora_alpha', 'lora_dropout', 'use_rslora']:
@@ -770,7 +1051,7 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
 
     def _init_multimodal_full(self):
         visual_cls = self.megatron_model_meta.visual_cls
-        if self.tuner_type == 'full' and self.is_multimodal and visual_cls is not None:
+        if self.tuner_type == 'full' and self.is_multimodal and visual_cls is not None and not self.language_model_only:
             vision_tower = [f'visual.{vit}' for vit in getattr(visual_cls, '_vision_tower', [])]
             aligner = [f'visual.{aligner}' for aligner in getattr(visual_cls, '_aligner', [])]
             generator = [f'visual.{generator}' for generator in getattr(visual_cls, '_generator', [])]
@@ -805,7 +1086,6 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
             self.torch_dtype = torch.bfloat16
             if self.main_grads_dtype == torch.float32:
                 self.accumulate_allreduce_grads_in_fp32 = True
-        self.params_dtype = self.torch_dtype
 
     def _init_weigh_decay(self):
         if self.weight_decay_incr_style == 'constant':

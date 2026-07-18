@@ -9,19 +9,35 @@ import base64
 import inspect
 import json
 import os
+import re
+import time
 import torch
 import uuid
+from accelerate.utils import broadcast_object_list
+from collections import OrderedDict, defaultdict, deque
 from contextlib import contextmanager, nullcontext
 from copy import copy
 from dacite import from_dict
+from dataclasses import asdict
 from megatron.core import mpu
-from typing import Any, Dict, List, Tuple, Union
+from transformers import AutoConfig
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from swift.infer_engine.protocol import RequestConfig, RolloutInferRequest, RolloutOutput
-from swift.rlhf_trainers.utils import (FlattenedTensorBucket, aggressive_empty_cache, check_vllm_version_ge,
+from swift.megatron.model import get_mcore_model
+from swift.rl_core.data import OnPolicySample
+from swift.rlhf_trainers.base_rollout_mixin import BaseRolloutTrainerMixin
+from swift.rlhf_trainers.gkd_helpers import resolve_dynamic_opd_self_distillation
+from swift.rlhf_trainers.utils import (VLLM_LORA_INT_ID, VLLM_LORA_NAME, VLLM_LORA_PATH, FlattenedTensorBucket,
+                                       TensorLoRARequest, add_base_layer_suffix_by_param_names, aggressive_empty_cache,
+                                       check_vllm_version_ge, expand_vllm_param_name_aliases, finish_vllm_weight_reload,
+                                       parse_prompt_logprobs, patch_vllm_load_adapter,
                                        patch_vllm_moe_model_weight_loader, profiling_context, profiling_decorator,
-                                       set_expandable_segments)
-from swift.utils import get_current_device, get_logger, is_last_rank, is_vllm_available, remove_response, to_device
+                                       set_expandable_segments, vllm_supports_lora_load_inplace)
+from swift.rlhf_trainers.vllm_client import VLLMInferClient
+from swift.rollout import invoke_async_hook, run_multi_turn
+from swift.utils import (JsonlWriter, get_current_device, get_logger, is_last_rank, is_vllm_available, remove_response,
+                         synchronize, to_device)
 from .utils import (gather_object, load_megatron_model_to_gpu, load_megatron_optimizer, offload_megatron_model_to_cpu,
                     offload_megatron_optimizer)
 
@@ -99,7 +115,10 @@ def create_rollout_group(trainer) -> torch.distributed.ProcessGroup:
     return trainer._rollout_group
 
 
-class MegatronRolloutMixin:
+class MegatronRolloutMixin(BaseRolloutTrainerMixin):
+
+    # Per-sample container class; subclasses override (GRPOSample / GKDSample).
+    sample_cls = OnPolicySample
 
     def _init_rollout_params(self):
         """Initialize rollout generation parameters."""
@@ -137,7 +156,138 @@ class MegatronRolloutMixin:
         """Get or create the rollout process group (TP×PP×CP)."""
         return create_rollout_group(self)
 
-    def _get_local_rollout_batch(self, batch: List[Dict]) -> List[Dict]:
+    def _setup_teacher(self) -> None:
+        """Resolve teacher mode from args and init the API client when applicable.
+
+        Sets ``teacher_model_server`` / ``use_teacher_api`` / ``_is_self_distillation`` /
+        ``_teacher_use_disable_adapter`` / ``offload_teacher_model`` / ``_has_teacher``.
+        Must be called before ``_init_rollout_engine`` (the API client lives on last rank).
+        """
+        args = self.args
+        self.teacher_model_server = getattr(args, 'teacher_model_server', None)
+        self.use_teacher_api = self.teacher_model_server is not None
+        self.offload_teacher_model = args.offload_teacher_model
+        self._teacher_use_disable_adapter = getattr(args, '_teacher_use_disable_adapter', False)
+        self._is_self_distillation = (args.teacher_model is None and self.teacher_model_server is None)
+        self._has_teacher_explicit = (
+            args.teacher_model is not None or self.teacher_model_server is not None
+            or self._teacher_use_disable_adapter)
+        self._is_dynamic_self_distillation = resolve_dynamic_opd_self_distillation(
+            has_teacher_explicit=self._has_teacher_explicit,
+            is_self_distillation=self._is_self_distillation,
+        )
+        self._has_teacher = self._has_teacher_explicit or self._is_dynamic_self_distillation
+        self.teacher_models = None
+        self.teacher_configs: list = []
+        self.teacher_clients: list = []
+        if self.use_teacher_api:
+            from swift.rlhf_trainers.gkd_helpers import parse_teacher_model_server
+            self.teacher_configs = parse_teacher_model_server(self.teacher_model_server)
+            if is_last_rank():
+                self.teacher_clients = [VLLMInferClient(base_urls=[cfg.url]) for cfg in self.teacher_configs]
+
+    def _load_teacher_model(self) -> None:
+        """Load the separate local teacher mcore model (called from ``prepare_model``).
+
+        No-op for the API path, dynamic self-distillation, and same-model LoRA
+        (disable_adapter) — those reuse the student weights or an external server.
+        """
+        if self.use_teacher_api or self._is_self_distillation or self._teacher_use_disable_adapter:
+            return
+        args = self.args
+        vp_size = getattr(args, 'virtual_pipeline_model_parallel_size', None)
+        assert vp_size is None or vp_size == 1, 'Teacher distillation does not support VPP.'
+        self.teacher_hf_config = AutoConfig.from_pretrained(args.teacher_model_dir, trust_remote_code=True)
+        self.teacher_models = get_mcore_model(args, self.teacher_hf_config)
+        self.teacher_config = self.teacher_models[0].config
+        if not args.use_cpu_initialization:
+            for teacher_model in self.teacher_models:
+                teacher_model.cuda(torch.cuda.current_device())
+        for teacher_model in self.teacher_models:
+            teacher_model.requires_grad_(False)
+            teacher_model.eval()
+        self.teacher_config.bridge.load_weights(self.teacher_models, args.teacher_model_dir)
+        if self.offload_teacher_model:
+            self._offload_teacher_models()
+            logger.info('Teacher models offloaded to CPU to save GPU memory')
+
+    def _offload_teacher_models(self) -> None:
+        if self.teacher_models and not self.use_teacher_api:
+            offload_megatron_model_to_cpu(self.teacher_models)
+
+    def _load_teacher_models_to_gpu(self) -> None:
+        if self.teacher_models and not self.use_teacher_api:
+            load_megatron_model_to_gpu(self.teacher_models, load_grad=False)
+
+    @contextmanager
+    def load_teacher_model_context(self):
+        """Load the teacher to GPU for a forward and offload after (when offloading is on)."""
+        if not self.offload_teacher_model or self.teacher_models is None:
+            yield
+            return
+        self._load_teacher_models_to_gpu()
+        try:
+            yield
+        finally:
+            self._offload_teacher_models()
+
+    def _gather_teacher_requests(self, requests: List[RolloutInferRequest]) -> Dict[str, Any]:
+        """Phase 1 (all ranks, collective): gather this teacher's rollout-group-rank-0 requests.
+
+        Only rollout-group rank 0 contributes (others hold TP/PP/CP replicas of the same data);
+        contributions are tagged with ``dp_rank`` so segments order by DP rank regardless of world
+        layout or empty (zero-routed) subsets. Returns a handle with the per-DP-rank segments (for
+        the main-process infer) plus this DP rank's offset/length (for the later slice). The offset
+        is the prefix sum of preceding DP ranks' lengths, not ``dp_rank * n``: under multi-teacher
+        routing each DP rank's subset may differ in length, so equal-length slicing misaligns.
+        """
+        rollout_group = self._get_rollout_group()
+        rollout_rank = torch.distributed.get_rank(group=rollout_group)
+        dp_rank = mpu.get_data_parallel_rank()
+        contribution = (dp_rank, list(requests)) if rollout_rank == 0 else None
+
+        world_size = torch.distributed.get_world_size()
+        all_contributions = [None] * world_size
+        torch.distributed.all_gather_object(all_contributions, contribution)
+
+        segments_by_dp = {dp: reqs for c in all_contributions if c is not None for dp, reqs in [c]}
+        dp_ranks_sorted = sorted(segments_by_dp)
+        offset = sum(len(segments_by_dp[dp]) for dp in dp_ranks_sorted if dp < dp_rank)
+        flat_global = [req for dp in dp_ranks_sorted for req in segments_by_dp[dp]]
+        return {'flat_global': flat_global, 'offset': offset, 'n_local': len(requests)}
+
+    def _infer_teacher_requests(self, handle: Dict[str, Any], topk: int, teacher_client: Optional[Any] = None):
+        """Phase 2 (main process only, no collective): run the teacher HTTP infer.
+
+        Safe to call concurrently across teachers (distinct clients, no collective inside).
+        """
+        if not handle['flat_global']:  # no sample routed to this teacher: skip the empty HTTP call
+            return []
+        client = teacher_client if teacher_client is not None else self.teacher_clients[0]
+        request_config = RequestConfig(prompt_logprobs=topk, max_tokens=1, temperature=0.0)
+        responses = client.infer(handle['flat_global'], request_config=request_config, use_tqdm=False)
+        return [parse_prompt_logprobs(r, topk=topk) for r in responses]
+
+    def _scatter_teacher_parsed(self, handle: Dict[str, Any], parsed_global):
+        """Phase 3 (all ranks, collective): broadcast the parsed result and slice this rank's part."""
+        world_size = torch.distributed.get_world_size()
+        obj_list = [parsed_global]
+        torch.distributed.broadcast_object_list(obj_list, src=world_size - 1)
+        parsed_global = obj_list[0]
+        offset, n = handle['offset'], handle['n_local']
+        return parsed_global[offset:offset + n]
+
+    def _fetch_teacher_parsed_logprobs(self,
+                                       requests: List[RolloutInferRequest],
+                                       topk: int,
+                                       teacher_client: Optional[Any] = None):
+        """Combined gather→infer→broadcast for a single teacher (serial); returns this rank's slice."""
+        handle = self._gather_teacher_requests(requests)
+        parsed_global = self._infer_teacher_requests(handle, topk, teacher_client) \
+            if self.is_main_process else None
+        return self._scatter_teacher_parsed(handle, parsed_global)
+
+    def _get_local_rollout_batch(self, samples: List[OnPolicySample]) -> List[OnPolicySample]:
         """Split batch within rollout group for distributed vLLM generation.
 
         The batch is evenly split across the rollout group (TP×PP×CP ranks with
@@ -152,16 +302,16 @@ class MegatronRolloutMixin:
         where rollout_group_size = tp_size * pp_size * cp_size, and world_size = dp_size * rollout_group_size.
 
         Args:
-            batch: Full batch of data samples
+            samples: Full batch of data samples
 
         Returns:
-            Local slice of batch for this rank to process
+            Local slice of samples for this rank to process
         """
         rollout_group = self._get_rollout_group()
         rollout_rank = torch.distributed.get_rank(group=rollout_group)
         rollout_group_size = torch.distributed.get_world_size(group=rollout_group)
 
-        total_batch_size = len(batch)
+        total_batch_size = len(samples)
         assert total_batch_size % rollout_group_size == 0, \
             f'Batch size ({total_batch_size}) must be divisible by rollout group size ({rollout_group_size})'
 
@@ -169,19 +319,19 @@ class MegatronRolloutMixin:
         start_idx = rollout_rank * per_device_batch_size
         end_idx = start_idx + per_device_batch_size
 
-        return batch[start_idx:end_idx]
+        return samples[start_idx:end_idx]
 
-    def _gather_rollout_results(self, local_batch: List[Dict]) -> List[Dict]:
+    def _gather_rollout_results(self, samples: List[OnPolicySample]) -> List[OnPolicySample]:
         """Gather rollout results from all ranks in the rollout group.
 
         Args:
-            local_batch: Local rollout results from this rank
+            samples: Local rollout results from this rank
 
         Returns:
             Gathered results from all ranks in the rollout group
         """
         rollout_group = self._get_rollout_group()
-        return gather_object(local_batch, group=rollout_group)
+        return gather_object(samples, group=rollout_group)
 
     def _init_rollout_engine(self):
         """Initialize vLLM engine for rollout generation."""
@@ -195,6 +345,10 @@ class MegatronRolloutMixin:
         self.vllm_use_async_engine = False
         self.enable_offload = False
         self.vllm_version_ge_0_10_2 = check_vllm_version_ge('0.10.2')
+        self.rollout_enable_lora = False
+        self.enable_server_multi_turn = False
+        self.base_sync_done = False
+        self._cached_vllm_param_names = None
 
         if not args.use_vllm:
             return
@@ -208,7 +362,17 @@ class MegatronRolloutMixin:
 
         if self.vllm_mode == 'server':
             # Server mode uses external vLLM server
-            pass
+            if self.is_main_process:
+                self.vllm_client.get_engine_type()
+                self.vllm_client.reset_mm_cache()
+                enable_lora = [self.vllm_client.enable_lora]
+                enable_multi_turn = [self.vllm_client.enable_multi_turn]
+            else:
+                enable_lora = [False]
+                enable_multi_turn = [False]
+            self.rollout_enable_lora = broadcast_object_list(enable_lora, from_process=self.world_size - 1)[0]
+            self.enable_server_multi_turn = broadcast_object_list(
+                enable_multi_turn, from_process=self.world_size - 1)[0]
         elif self.vllm_mode == 'colocate':
             if self.world_size % self.vllm_tensor_parallel_size != 0:
                 raise ValueError(f'vllm_tensor_parallel_size ({self.vllm_tensor_parallel_size}) must divide world size '
@@ -220,6 +384,7 @@ class MegatronRolloutMixin:
             with context():
                 set_expandable_segments(False)
                 self.engine = self._prepare_vllm_engine()
+                self.engine.engine.reset_mm_cache()
                 if args.sleep_level > 0:
                     self.engine.engine.sleep(args.sleep_level)
                 set_expandable_segments(True)
@@ -243,7 +408,28 @@ class MegatronRolloutMixin:
         logprobs_mode = 'processed_logprobs' if self.vllm_version_ge_0_10_2 else None
 
         vllm_engine_kwargs = args.vllm_engine_kwargs or {}
-        load_format = vllm_engine_kwargs.pop('load_format', 'dummy')
+        load_format = vllm_engine_kwargs.pop('load_format', 'auto')
+
+        if self.args.router_replay_mode == 'R3':
+            assert check_vllm_version_ge('0.14.0'), \
+                'The enable_return_routed_experts attribute is not supported. Please upgrade vllm to 0.14.0 or higher'
+            vllm_engine_kwargs['enable_return_routed_experts'] = True
+            # https://github.com/vllm-project/vllm/pull/39917
+            import vllm
+            from packaging import version
+            vllm_version = vllm.__version__
+            if vllm_version is not None and version.parse('0.21.0rc1') <= version.parse(vllm_version) <= version.parse(
+                    '0.21.0'):
+                vllm_engine_kwargs.setdefault('async_scheduling', False)
+
+        enable_lora = False
+        max_loras = 1
+        max_lora_rank = args.lora_rank
+        if args.tuner_type == 'lora' and args.vllm_enable_lora:
+            enable_lora = True
+            self.rollout_enable_lora = True
+            patch_vllm_load_adapter()
+            logger.info(f'Enabled vLLM LoRA adapter sync with max_lora_rank={args.lora_rank}')
 
         engine = GRPOVllmEngine(
             args.model_info.model_dir,
@@ -264,6 +450,9 @@ class MegatronRolloutMixin:
             mm_processor_cache_gb=args.vllm_mm_processor_cache_gb,
             template=vllm_template,
             distributed_executor_backend='external_launcher',
+            enable_lora=enable_lora,
+            max_loras=max_loras,
+            max_lora_rank=max_lora_rank,
             engine_kwargs=vllm_engine_kwargs,
             logprobs_mode=logprobs_mode)
 
@@ -274,24 +463,103 @@ class MegatronRolloutMixin:
 
     @profiling_decorator
     def _move_model_to_vllm(self):
-        """Synchronize model weights to vLLM engine."""
-        is_lora_training = self.args.tuner_type == 'lora'
+        """Synchronize model weights to vLLM engine.
+
+        - Full sync: when tuner_type != 'lora' (e.g. full, lora_llm), or first sync
+          (base_sync_done=False), or sleep_level==2, or rollout_enable_lora is disabled.
+        - Adapter-only sync: when tuner_type == 'lora' with rollout_enable_lora=True and
+          base weights have already been synced.
+        """
+        args = self.args
+        tuner_type = args.tuner_type
+
+        if (tuner_type != 'lora' or (not self.base_sync_done or args.sleep_level == 2) or not self.rollout_enable_lora):
+            self._move_full_model_to_vllm()
+        else:
+            self._move_adapter_to_vllm()
+
+        self._reset_vllm_cache()
+
+    def _reset_vllm_cache(self):
+        # Reset prefix cache and encoder cache
+        vllm_ge_16 = check_vllm_version_ge('0.16')
+        if self.vllm_mode == 'server' and self.is_main_process:
+            self.vllm_client.reset_prefix_cache()
+            if vllm_ge_16:
+                self.vllm_client.reset_encoder_cache()
+        elif self.vllm_mode == 'colocate':
+            self.engine.engine.reset_prefix_cache()
+            if vllm_ge_16:
+                self.engine.engine.reset_encoder_cache()
+
+    def _move_full_model_to_vllm(self):
+        """Transfer full model weights to vLLM engine.
+
+        For LoRA training (tuner_type == 'lora'):
+        - When rollout_enable_lora=False: merge LoRA into base, export merged weights, then unmerge.
+        - When rollout_enable_lora=True: export base weights only (no merge needed),
+          then follow up with adapter-only sync via _move_adapter_to_vllm.
+        For lora_llm: always merge LLM LoRA into exported dense weights (vLLM has no separate
+        adapter pass for this tuner_type; see _move_model_to_vllm).
+        """
+        is_lora_training = self.args.tuner_type in ('lora', 'lora_llm')
+        is_pure_lora = self.args.tuner_type == 'lora'
+        should_merge = not self.rollout_enable_lora
+        if self.args.tuner_type == 'lora_llm' and self.rollout_enable_lora:
+            logger.warning('lora_llm is not supported with vllm_enable_lora=True. plz set vllm_enable_lora to False')
 
         try:
-            if is_lora_training:
+            if should_merge:
                 self.merge_lora_adapters()
 
             self._export_and_load_weights()
 
         finally:
-            if is_lora_training:
+            if should_merge:
                 self.unmerge_lora_adapters()
 
-        # Reset prefix cache
-        if self.vllm_mode == 'server' and self.is_main_process:
-            self.vllm_client.reset_prefix_cache()
-        elif self.vllm_mode == 'colocate':
-            self.engine.engine.reset_prefix_cache()
+        if is_lora_training:
+            self.base_sync_done = True
+            if self.rollout_enable_lora and is_pure_lora:
+                self._move_adapter_to_vllm()
+
+    def _move_adapter_to_vllm(self):
+        """Transfer only LoRA adapter weights to vLLM engine.
+
+        Uses bridge.export_weights(peft_format=True) to export LoRA delta weights.
+        Yielded names follow PEFT convention: 'base_model.model.<hf_path>.lora_A.weight'.
+        """
+        target_device = 'cpu' if self.args.offload_bridge else None
+
+        with profiling_context(self, 'export_adapter_weights'):
+            adapter_iterator = self.bridge.export_weights(
+                self.unwrapped_models, target_device=target_device, peft_format=True)
+            lora_params = OrderedDict()
+            for name, tensor in adapter_iterator:
+                lora_params[name] = tensor.detach()
+
+        peft_config = self.unwrapped_models[0].peft_config.get('default', None)
+
+        if self.vllm_mode == 'colocate':
+            req_kw = dict(
+                lora_name=VLLM_LORA_NAME,
+                lora_int_id=VLLM_LORA_INT_ID,
+                lora_path=VLLM_LORA_PATH,
+                peft_config=asdict(peft_config),
+                lora_tensors=lora_params,
+            )
+            if vllm_supports_lora_load_inplace():
+                req_kw['load_inplace'] = True
+            lora_request = TensorLoRARequest(**req_kw)
+            self.engine.engine.add_lora(lora_request)
+        elif self.vllm_mode == 'server' and self.is_main_process:
+            bucket = FlattenedTensorBucket(named_tensors=list(lora_params.items()))
+            metadatas = bucket.get_metadata()
+            flattened_tensor = bucket.get_flattened_tensor()
+            self.vllm_client.update_adapter_flattened_param(peft_config, metadatas, flattened_tensor)
+            del bucket, metadatas, flattened_tensor
+
+        del lora_params
 
     def _export_and_load_weights(self):
         """Export weights from Megatron and load to vLLM."""
@@ -300,13 +568,39 @@ class MegatronRolloutMixin:
         with profiling_context(self, 'export_weights'):
             weight_iterator = self.bridge.export_weights(self.unwrapped_models, target_device=target_device)
 
+        if self.rollout_enable_lora:
+            vllm_param_names = self._get_vllm_param_names_for_mapping()
+            if vllm_param_names:
+                weight_iterator = add_base_layer_suffix_by_param_names(weight_iterator, vllm_param_names)
+
         if self.vllm_mode == 'colocate':
             llm_model = self.engine.inner_model
-            # Patch MoE weight_loader if needed
             patch_vllm_moe_model_weight_loader(llm_model)
             llm_model.load_weights(weight_iterator)
+            _model_config = self.engine.engine.model_config
+            finish_vllm_weight_reload(llm_model, model_config=_model_config, target_device=self.device)
         elif self.vllm_mode == 'server':
             self._load_weights_to_server_in_buckets(weight_iterator)
+            if self.is_main_process:
+                self.vllm_client.process_weights_after_loading()
+
+    def _get_vllm_param_names_for_mapping(self):
+        """Get vLLM runtime parameter names for base_layer mapping.
+
+        Returns an alias-expanded set so bridge/HF names can match vLLM packed names.
+        """
+        if self.vllm_mode == 'colocate':
+            llm_model = self.engine.inner_model
+            raw_names = set(dict[Any, Any](llm_model.named_parameters()).keys())
+            return expand_vllm_param_name_aliases(raw_names)
+
+        if self.vllm_mode != 'server' or not self.is_main_process:
+            return None
+
+        if self._cached_vllm_param_names is None:
+            keys = self.vllm_client.get_model_state_keys()
+            self._cached_vllm_param_names = expand_vllm_param_name_aliases(set(keys))
+        return self._cached_vllm_param_names
 
     def _load_weights_to_server_in_buckets(self, weight_iterator):
         """Load weights to vLLM server in buckets."""
@@ -334,6 +628,10 @@ class MegatronRolloutMixin:
         if not bucket_params or not self.is_main_process:
             return
 
+        # Ensure all async GPU ops (e.g. TP all-gather on NCCL stream from bridge.export_weights)
+        # are complete before .copy_() reads param data on the default stream.
+        synchronize()
+
         bucket = FlattenedTensorBucket(named_tensors=bucket_params)
         metadatas = bucket.get_metadata()
         flattened_tensor = bucket.get_flattened_tensor()
@@ -343,22 +641,22 @@ class MegatronRolloutMixin:
         del bucket, metadatas, flattened_tensor
 
     @profiling_decorator
-    def _generate_completions(self, batch: DataType) -> DataType:
+    def _generate_completions(self, samples: List[OnPolicySample]) -> List[OnPolicySample]:
         """Generate completions for a batch using vLLM engine.
 
         Args:
-            batch: List of input data with 'messages' field
-            step: Current training step (for weight sync tracking)
+            samples: List of OnPolicySample carrying messages + rollout fields
 
         Returns:
             Batch with rollout completion results merged in
         """
-        batch = self._preprocess_rollout_inputs(batch)
+        samples = self._preprocess_inputs(samples)
 
         # Wake up engine if sleeping (colocate mode)
         if self.vllm_mode == 'colocate' and self.engine.inner_model_executor.is_sleeping:
             wake_up_params = inspect.signature(self.engine.engine.wake_up).parameters
             kwargs = {'tags': ['weights']} if 'tags' in wake_up_params else {}
+            aggressive_empty_cache()
             self.engine.engine.wake_up(**kwargs)
 
         # Load model weights if needed
@@ -374,8 +672,27 @@ class MegatronRolloutMixin:
                 set_expandable_segments(False)
                 self.engine.engine.wake_up(tags=['kv_cache'])
 
-            # Rollout
-            outputs: List[RolloutOutput] = self._rollout(batch)
+            multi_turn_scheduler = getattr(self, 'multi_turn_scheduler', None)
+            colocate_multi_turn = (
+                multi_turn_scheduler is not None and not getattr(self, 'enable_server_multi_turn', False))
+
+            if colocate_multi_turn:
+                requests = self.samples2requests(samples)
+                invoke_async_hook(multi_turn_scheduler.on_trajectory_start(requests))
+                request_config = self._get_request_config()
+                outputs: List[RolloutOutput] = self._rollout_requests(requests, request_config)
+                outputs = run_multi_turn(
+                    requests=requests,
+                    first_turn_outputs=outputs,
+                    scheduler=multi_turn_scheduler,
+                    rollout_fn=lambda reqs, cfg: self._rollout_requests(reqs, cfg),
+                    request_config=request_config,
+                    max_turns=self.args.max_turns,
+                    gather_fn=lambda x: gather_object(x, group=self._get_rollout_group()),
+                )
+            else:
+                # Single-turn rollout (or server multi-turn handled by the engine).
+                outputs: List[RolloutOutput] = self._rollout(samples)
 
             # Sleep to release memory
             if self.vllm_mode == 'colocate' and self.args.sleep_level > 0:
@@ -384,19 +701,32 @@ class MegatronRolloutMixin:
                 aggressive_empty_cache()
                 set_expandable_segments(True)
 
-            batch = self._postprocess_rollout_outputs(batch, outputs)
+            samples = self._postprocess_rollout_outputs(samples, outputs)
 
-        return batch
+        return samples
 
-    def _rollout(self, batch: DataType) -> List[RolloutOutput]:
-        """Execute rollout using vLLM engine."""
-        batch = self._set_inputs_system(batch)
+    def _rollout_requests(self, requests: List[RolloutInferRequest],
+                          request_config: RequestConfig) -> List[RolloutOutput]:
+        """Continuation rollout taking already-prepared ``RolloutInferRequest`` objects.
+
+        Used by the multi-turn driver (:func:`swift.rollout.run_multi_turn`) on
+        every turn after the first. ``_set_inputs_system`` is skipped because the
+        system prompt is already encoded into ``requests[i].messages``.
+        """
+        if self.vllm_mode == 'server':
+            return self._server_rollout(requests, request_config)
+        elif self.vllm_mode == 'colocate':
+            return self._colocate_rollout(requests, request_config)
+        raise ValueError(f'Invalid vllm_mode: {self.vllm_mode}')
+
+    def _rollout(self, samples: List[OnPolicySample]) -> List[RolloutOutput]:
+        """Execute rollout using vLLM engine (system already injected by _preprocess_inputs)."""
         request_config = self._get_request_config()
 
         if self.vllm_mode == 'server':
-            return self._server_rollout(batch, request_config)
+            return self._server_rollout(samples, request_config)
         elif self.vllm_mode == 'colocate':
-            return self._colocate_rollout(batch, request_config)
+            return self._colocate_rollout(samples, request_config)
 
     def _get_request_config(self) -> RequestConfig:
         """Get request config with proper seed for distributed TP groups."""
@@ -409,11 +739,10 @@ class MegatronRolloutMixin:
 
         return request_config
 
-    def _server_rollout(self, inputs: DataType, request_config: RequestConfig) -> List[RolloutOutput]:
+    def _server_rollout(self, samples: Union[List[OnPolicySample], List[RolloutInferRequest]],
+                        request_config: RequestConfig) -> List[RolloutOutput]:
         """Perform rollout using vLLM server mode."""
-        from accelerate.utils import broadcast_object_list
-
-        infer_requests = self._inputs_to_requests(inputs)
+        infer_requests = self.samples2requests(samples)
 
         all_requests = gather_object(infer_requests)
         all_requests_lengths = gather_object([len(infer_requests)])
@@ -424,7 +753,13 @@ class MegatronRolloutMixin:
         if self.is_main_process:
             all_outputs: List[RolloutOutput] = self.vllm_client.infer(
                 infer_requests=all_requests, request_config=request_config)
-            assert len(all_outputs) == len(all_requests)
+            if len(all_outputs) != len(all_requests):
+                # Per-turn-split multi-turn (`dynamic_num_samples`) is HF-only
+                raise NotImplementedError(
+                    'Per-turn-split multi-turn (dynamic_num_samples) is not supported on Megatron — '
+                    f'server returned {len(all_outputs)} outputs for {len(all_requests)} requests. '
+                    'Return one RolloutOutput per request from MultiTurnScheduler.run (combine turns '
+                    'inside response_token_ids: List[List[int]]), or use the HF trainer.')
         else:
             all_outputs = [None] * len(all_requests)
 
@@ -435,135 +770,169 @@ class MegatronRolloutMixin:
 
         return outputs
 
-    def _colocate_rollout(self, batch: DataType, request_config: RequestConfig) -> List[RolloutOutput]:
+    def _colocate_rollout(self, samples: Union[List[OnPolicySample], List[RolloutInferRequest]],
+                          request_config: RequestConfig) -> List[RolloutOutput]:
         """Perform co-located rollout with vLLM engine."""
+        # Normalize samples (first turn) / RolloutInferRequest (continuation turns)
+        # into engine-ready requests.
+        samples = self.samples2requests(samples)
         start_idx = 0
-        end_idx = len(batch)
+        end_idx = len(samples)
 
         # Handle vLLM tensor parallelism
         if self.vllm_tensor_parallel_size > 1:
             local_rank_in_group = torch.distributed.get_rank(group=self.vllm_tp_group)
-            local_input_length = len(batch)
+            local_input_length = len(samples)
             all_input_lengths = [None] * self.vllm_tensor_parallel_size
             torch.distributed.all_gather_object(all_input_lengths, local_input_length, group=self.vllm_tp_group)
 
             start_idx = sum(all_input_lengths[:local_rank_in_group])
             end_idx = start_idx + all_input_lengths[local_rank_in_group]
 
-            gathered_batch = [None for _ in range(self.vllm_tensor_parallel_size)]
-            torch.distributed.all_gather_object(gathered_batch, batch, group=self.vllm_tp_group)
-            batch = [p for sublist in gathered_batch for p in sublist]
+            gathered = [None for _ in range(self.vllm_tensor_parallel_size)]
+            torch.distributed.all_gather_object(gathered, samples, group=self.vllm_tp_group)
+            samples = [p for sublist in gathered for p in sublist]
 
         outputs: List[RolloutOutput] = self.engine.infer(
-            infer_requests=batch, request_config=request_config, use_tqdm=False)
+            infer_requests=samples, request_config=request_config, use_tqdm=False)
 
         if self.vllm_tensor_parallel_size > 1:
+            # R3 router replay: vLLM's routing capturer host cache only exists on
+            # TP rank 0, so non-primary TP ranks have routed_experts=None in outputs.
+            # Broadcast routed_experts from TP primary to all TP ranks.
+            if getattr(self.args, 'router_replay_mode', None) == 'R3':
+                routed_experts_list = [output.response.choices[0].routed_experts for output in outputs]
+                tp_primary_global_rank = torch.distributed.get_global_rank(self.vllm_tp_group, 0)
+                torch.distributed.broadcast_object_list(
+                    routed_experts_list, src=tp_primary_global_rank, group=self.vllm_tp_group)
+                if local_rank_in_group != 0:
+                    for output, experts in zip(outputs, routed_experts_list):
+                        output.response.choices[0].routed_experts = experts
             outputs = outputs[start_idx:end_idx]
 
         return outputs
 
-    def _preprocess_rollout_inputs(self, inputs: DataType) -> DataType:
-        """Preprocess inputs before rollout inference."""
-        # Add unique request_id
-        for input_item in inputs:
-            if 'request_id' not in input_item:
-                input_item['request_id'] = f'chatcmpl-{str(uuid.uuid4().hex)}'
-            remove_response(input_item['messages'])
-        return inputs
+    def _preprocess_inputs(self, samples: List[OnPolicySample]) -> List[OnPolicySample]:
+        """Preprocess samples before rollout inference.
 
-    def _set_inputs_system(self, inputs: DataType) -> DataType:
-        """Insert default system message if not present."""
-        if not self.template.template_meta.default_system:
-            return inputs
-        if all(inp['messages'][0]['role'] == 'system' for inp in inputs):
-            return inputs
-        for inp in inputs:
-            messages = inp['messages']
-            if messages[0]['role'] != 'system':
-                messages.insert(0, {'role': 'system', 'content': self.template.template_meta.default_system})
-        return inputs
+        Unified pre-processing (mirrors HF RolloutTrainerMixin._preprocess_inputs):
+        1. Insert default system message if absent
+        2. Assign unique request_id (for rollout tracking)
+        3. Strip any prior assistant response (prompt-only for generation)
+        """
+        samples = self._set_inputs_system(samples)
+        for s in samples:
+            if not s.request_id:
+                s.request_id = f'chatcmpl-{str(uuid.uuid4().hex)}'
+            remove_response(s.messages)
+        return samples
 
-    def _inputs_to_requests(self, inputs: DataType) -> List[RolloutInferRequest]:
-        """Convert raw input data into RolloutInferRequest objects."""
+    def samples2requests(self, samples: Union[List[OnPolicySample],
+                                              List[RolloutInferRequest]]) -> List[RolloutInferRequest]:
+        """Convert samples into RolloutInferRequest objects.
 
-        def _process_image_data(image_data: Union[dict, str]) -> str:
-            if isinstance(image_data, dict):
-                if image_data.get('bytes'):
-                    return base64.b64encode(image_data['bytes']).decode('utf-8')
-                if image_data.get('path'):
-                    return image_data['path']
-            return image_data
-
-        if not inputs:
+        Already-built ``RolloutInferRequest`` (multi-turn continuation) pass
+        through unchanged. The per-sample mapping lives in
+        ``OnPolicySample.to_infer_request``.
+        """
+        if not samples:
             return []
-
-        REQUEST_METADATA_FIELDS = ['messages', 'images', 'audios', 'videos', 'tools', 'objects', 'uuid']
         requests_list = []
-
-        for data in inputs:
+        for data in samples:
             if isinstance(data, RolloutInferRequest):
                 requests_list.append(data)
-                continue
-
-            request_data = {key: data[key] for key in REQUEST_METADATA_FIELDS if key in data and data[key] is not None}
-            if 'uuid' not in request_data:
-                request_data['uuid'] = data.get('request_id', str(uuid.uuid4().hex))
-
-            if 'images' in request_data and request_data['images']:
-                imgs = request_data['images']
-                if not isinstance(imgs, list):
-                    imgs = [imgs]
-                request_data['images'] = [_process_image_data(img) for img in imgs]
-
-            if 'tools' in request_data and isinstance(request_data['tools'], str):
-                try:
-                    request_data['tools'] = json.loads(request_data['tools'])
-                except json.JSONDecodeError:
-                    pass
-
-            request_obj = from_dict(RolloutInferRequest, request_data)
-            requests_list.append(request_obj)
-
+            else:
+                include_extra = bool(getattr(self.args, 'vllm_server_pass_dataset', False)) or bool(
+                    getattr(self, 'multi_turn_scheduler', None))
+                requests_list.append(data.to_infer_request(include_extra=include_extra))
         return requests_list
 
-    def _postprocess_rollout_outputs(self, inputs: DataType, outputs: List[RolloutOutput]) -> DataType:
-        """Post-process rollout outputs and merge into inputs."""
+    def _log_completions_from_samples(self, samples: List[OnPolicySample]) -> None:
+        """Log prompts/completions from sample messages (post-filtering).
 
-        def merge_output(input_data: Dict, output: RolloutOutput) -> Dict:
-            response = output.response
-            choice = response.choices[0]
-
-            if output.messages:
-                input_data['messages'] = output.messages
+        Unlike ``_log_rollout`` (which needs raw RolloutOutput objects), this
+        method reads completions directly from ``sample.messages[-1]['content']``,
+        so it works after ``_dynamic_sampling`` has filtered / resampled samples.
+        """
+        if not self.log_completions:
+            return
+        messages = gather_object([s.messages for s in samples])
+        completions = []
+        for s in samples:
+            content = s.messages[-1]['content'] if s.messages else ''
+            if isinstance(content, str):
+                completions.append(content)
+            elif isinstance(content, list):
+                completions.append(self.template.safe_decode(content))
+            elif isinstance(content, dict) and 'input_ids' in content:
+                completions.append(self.template.safe_decode(content['input_ids']))
             else:
-                messages = input_data['messages']
-                remove_response(messages)
-                messages.append({'role': 'assistant', 'content': choice.message.content})
+                completions.append(str(content))
+        completions = gather_object(completions)
+        self._logs['prompt'].extend(self._apply_chat_template_to_messages_list(messages))
+        self._logs['completion'].extend(completions)
 
-            if output.response_token_ids:
-                input_data['response_token_ids'] = output.response_token_ids
-                if output.response_loss_mask:
-                    input_data['response_loss_mask'] = output.response_loss_mask
-            else:
-                input_data['response_token_ids'] = choice.token_ids
+    def _prepare_logging(self):
+        """Initialize logging infrastructure (shared by GRPO and GKD)."""
+        args = self.args
+        self.log_completions = getattr(args, 'log_completions', False)
+        self.wandb_log_unique_prompts = getattr(args, 'wandb_log_unique_prompts', False)
+        self.jsonl_writer = JsonlWriter(os.path.join(args.output_dir, 'completions.jsonl'), write_on_rank='last')
+        self._last_logged_step = -1
+        self._logs = {
+            'prompt': deque(),
+            'completion': deque(),
+        }
 
-            if output.rollout_infos:
-                input_data['rollout_infos'] = output.rollout_infos
+    def _flush_log_completions(self):
+        """Flush accumulated completion logs to jsonl/wandb/swanlab."""
+        if not (self.log_completions and self.is_main_process and len(self._logs['prompt']) > 0):
+            return
+        if self._step == self._last_logged_step:
+            return
+        self._last_logged_step = self._step
 
-            input_data['finish_reason'] = choice.finish_reason
-            input_data['is_truncated'] = choice.finish_reason == 'length'
-            input_data['add_eos'] = False
+        table = self._build_log_table()
+        self.jsonl_writer.append(table)
+        for val in self._logs.values():
+            if isinstance(val, deque):
+                val.clear()
+            elif isinstance(val, defaultdict):
+                for d in val.values():
+                    d.clear()
 
-            if output.rollout_logprobs:
-                input_data['rollout_logprobs'] = output.rollout_logprobs
-            elif choice.logprobs is not None and 'content' in choice.logprobs:
-                rollout_logprobs = [item['logprob'] for item in choice.logprobs['content']]
-                input_data['rollout_logprobs'] = [rollout_logprobs]
+        args = self.args
+        if 'wandb' in args.report_to:
+            import pandas as pd
+            import wandb
+            df = pd.DataFrame(table)
+            if self.wandb_log_unique_prompts:
+                df = df.drop_duplicates(subset=['prompt'])
+            wandb.log({'completions': wandb.Table(dataframe=df)}, commit=False)
+        if 'swanlab' in args.report_to:
+            import swanlab
+            headers = list(table.keys())
+            rows = [[table[h][i] for h in headers] for i in range(len(table.get('gen_step', table['prompt'])))]
+            swanlab.log({'completions': swanlab.echarts.Table().add(headers, rows)})
 
-            return input_data
+    def _build_log_table(self) -> Dict[str, list]:
+        """Build the completion log table. Subclasses extend with extra columns (rewards/advantages)."""
+        return {
+            'gen_step': [self._step - 1] * len(self._logs['prompt']),
+            'prompt': list(self._logs['prompt']),
+            'completion': list(self._logs['completion']),
+        }
 
-        assert len(inputs) == len(outputs)
-        return [merge_output(inp, out) for inp, out in zip(inputs, outputs)]
+    def _apply_chat_template_to_messages_list(self, messages_list):
+        """Convert messages list to prompt text using template."""
+        from swift.template import TemplateInputs
+        prompts_text = []
+        for messages in messages_list:
+            remove_response(messages)
+            template_inputs = TemplateInputs.from_dict({'messages': messages})
+            res = self.template.encode(template_inputs)
+            prompts_text.append(self.template.safe_decode(res['input_ids']))
+        return prompts_text
 
     @contextmanager
     def offload_context(self):

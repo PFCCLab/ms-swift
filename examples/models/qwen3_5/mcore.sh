@@ -1,15 +1,10 @@
-# Packing is not recommended due to the presence of linear_attention
-# Reason reference: https://github.com/modelscope/ms-swift/blob/main/examples/models/qwen3_next/mcore.sh
 # 4 * 40GiB
-# Without fla and causal-conv1d installed, the training time in H20 environment is 14 minutes.
-# For slow training speed issues after installing fla, please refer to this issue:
-# https://github.com/modelscope/ms-swift/issues/8145
 
 PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
 NPROC_PER_NODE=4 \
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
-MAX_PIXELS=1003520 \
-VIDEO_MAX_PIXELS=50176 \
+IMAGE_MAX_TOKEN_NUM=1024 \
+VIDEO_MAX_TOKEN_NUM=128 \
 FPS_MAX_FRAMES=12 \
 megatron sft \
     --model Qwen/Qwen3.5-35B-A3B \
@@ -21,6 +16,7 @@ megatron sft \
               'AI-ModelScope/LaTeX_OCR:human_handwrite#2000' \
     --load_from_cache_file true \
     --add_non_thinking_prefix true \
+    --loss_scale ignore_empty_think \
     --split_dataset_ratio 0.01 \
     --tuner_type lora \
     --lora_rank 8 \
@@ -63,11 +59,11 @@ megatron sft \
 
 # PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
 # CUDA_VISIBLE_DEVICES=0,1,2,3 \
-# MAX_PIXELS=1003520 \
-# VIDEO_MAX_PIXELS=50176 \
+# IMAGE_MAX_TOKEN_NUM=1024 \
+# VIDEO_MAX_TOKEN_NUM=128 \
 # FPS_MAX_FRAMES=12 \
 # swift infer \
-#     --model megatron_output/vx-xxx/checkpoint-xxx-merged \
+#     --model megatron_output/Qwen3.5-35B-A3B/vx-xxx/checkpoint-xxx-merged \
 #     --stream true \
 #     --experts_impl grouped_mm \
 #     --enable_thinking false \

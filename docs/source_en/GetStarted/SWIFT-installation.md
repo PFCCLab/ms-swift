@@ -6,11 +6,17 @@ You can install it using pip:
 
 ```shell
 # recommend
-pip install 'ms-swift'
-# For evaluation usage
+pip install 'ms-swift' -U
+# Install additional Megatron dependencies
+pip install 'ms-swift[megatron]' -U
+# Install additional evaluation dependencies
 pip install 'ms-swift[eval]' -U
 # Full capabilities
 pip install 'ms-swift[all]' -U
+
+# Using uv
+pip install uv
+uv pip install 'ms-swift' --torch-backend=auto
 ```
 
 ## Source Code Installation
@@ -19,7 +25,7 @@ The current main branch is for swift 4.x version.
 # pip install git+https://github.com/modelscope/ms-swift.git
 
 # Full capabilities
-# pip install "git+https://github.com/modelscope/ms-swift.git#egg=ms-swift[all]"
+# pip install "ms-swift[all]@git+https://github.com/modelscope/ms-swift.git"
 
 git clone https://github.com/modelscope/ms-swift.git
 cd ms-swift
@@ -34,11 +40,14 @@ Installing swift 3.x:
 # pip install "git+https://github.com/modelscope/ms-swift.git@release/3.12"
 
 # Full capabilities
-# pip install "git+https://github.com/modelscope/ms-swift.git@release/3.12#egg=ms-swift[all]"
+# pip install "ms-swift[all]@git+https://github.com/modelscope/ms-swift.git@release/3.12"
 
 git clone -b release/3.12 https://github.com/modelscope/ms-swift.git
 cd ms-swift
 pip install -e .
+
+# Using uv
+uv pip install -e . --torch-backend=auto
 
 # Full capabilities
 # pip install -e '.[all]'
@@ -46,7 +55,31 @@ pip install -e .
 
 ## Mirror
 
-You can check Docker [here](https://github.com/modelscope/modelscope/blob/build_swift_image/docker/build_image.py#L347).
+You can check Docker [here](https://github.com/modelscope/modelscope/blob/build_swift_image/docker/build_image.py#L392).
+```
+# swift4.3.2
+modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda13.0.3-py312-torch2.11.0-vllm0.23.0-modelscope1.37.1-swift4.3.2
+modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda13.0.3-py312-torch2.11.0-vllm0.23.0-modelscope1.37.1-swift4.3.2
+modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda13.0.3-py312-torch2.11.0-vllm0.23.0-modelscope1.37.1-swift4.3.2
+
+# swift4.2.3
+modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda13.0.3-py312-torch2.11.0-vllm0.21.0-modelscope1.36.3-swift4.2.3
+modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda13.0.3-py312-torch2.11.0-vllm0.21.0-modelscope1.36.3-swift4.2.3
+modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda13.0.3-py312-torch2.11.0-vllm0.21.0-modelscope1.36.3-swift4.2.3
+
+# swift4.1.3
+modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.9.1-py312-torch2.10.0-vllm0.19.1-modelscope1.35.4-swift4.1.3
+modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.9.1-py312-torch2.10.0-vllm0.19.1-modelscope1.35.4-swift4.1.3
+modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.9.1-py312-torch2.10.0-vllm0.19.1-modelscope1.35.4-swift4.1.3
+
+# swift4.0.3
+modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.8.1-py311-torch2.10.0-vllm0.17.1-modelscope1.34.0-swift4.0.3
+modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.8.1-py311-torch2.10.0-vllm0.17.1-modelscope1.34.0-swift4.0.3
+modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.8.1-py311-torch2.10.0-vllm0.17.1-modelscope1.34.0-swift4.0.3
+```
+
+<details><summary>Historical Mirrors</summary>
+
 ```
 # swift3.12.5
 modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.8.1-py311-torch2.9.0-vllm0.13.0-modelscope1.33.0-swift3.12.5
@@ -67,11 +100,7 @@ modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu2
 modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.8.1-py311-torch2.8.0-vllm0.11.0-modelscope1.31.0-swift3.9.3
 modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.8.1-py311-torch2.8.0-vllm0.11.0-modelscope1.31.0-swift3.9.3
 modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.8.1-py311-torch2.8.0-vllm0.11.0-modelscope1.31.0-swift3.9.3
-```
 
-<details><summary>Historical Mirrors</summary>
-
-```
 # swift3.8.3
 modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.6.3-py311-torch2.7.1-vllm0.10.1.1-modelscope1.29.2-swift3.8.3
 modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.6.3-py311-torch2.7.1-vllm0.10.1.1-modelscope1.29.2-swift3.8.3
@@ -124,18 +153,18 @@ More images can be found [here](https://modelscope.cn/docs/intro/environment-set
 
 |              | Range        | Recommended         | Notes                                     |
 |--------------|--------------|---------------------|-------------------------------------------|
-| python       | >=3.9        | 3.10/3.11                |                                           |
-| cuda         |              | cuda12              | No need to install if using CPU, NPU, MPS |
-| torch        | >=2.0        | 2.8.0/2.9.1         |       torch2.9 [conv3d slow](https://swift.readthedocs.io/en/latest/BestPractices/Qwen3-VL-Best-Practice.html#environment-setup)     |
-| transformers | >=4.33       | 4.57.6              |                                           |
+| python       | >=3.10        | 3.12                |                                           |
+| cuda         |              | cuda12.8/13.0    | No need to install if using CPU, NPU, MPS |
+| torch        | >=2.0        | 2.8.0/2.11.0         |                            |
+| transformers | >=4.33       | 4.57.6/5.12.1              |                          |
 | modelscope   | >=1.23       |                     |                                           |
-| peft         | >=0.11,<0.19 |                     |                                           |
-| flash_attn   |              | 2.8.3/3.0.0b1 |                                           |
-| trl          | >=0.15,<0.29 | 0.28.0              | RLHF                                      |
-| deepspeed    | >=0.14       | 0.18.6              | Training                                  |
-| vllm         | >=0.5.1      | 0.11.0/0.15.1       | Inference/Deployment                      |
+| datasets     | >=3.0,<4.8.5 | 3.6.0/4.8.4         |                    |
+| peft         | >=0.11,<0.20 |                     |                                           |
+| flash_attn   |              | 2.8.3/4.0.0b15 |                                           |
+| trl          | >=0.15,<1.0 | 0.29.1              | RLHF                                      |
+| deepspeed    | >=0.14       | 0.18.9              | Training                                  |
+| vllm         | >=0.5.1      | 0.11.0/0.23.0       | Inference/Deployment                      |
 | sglang       | >=0.4.6      |          | Inference/Deployment                      |
-| lmdeploy     | >=0.5   | 0.10.1                 | Inference/Deployment                      |
 | evalscope    | >=1.0       |                     | Evaluation                                |
 | gradio       |              | 5.32.1              | Web-UI/App                                |
 

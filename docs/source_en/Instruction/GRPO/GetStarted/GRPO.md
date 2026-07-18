@@ -1,7 +1,5 @@
 # GRPO
 
-GRPOTrainer underwent a code refactoring in ms-swift3.5. If you are using a swift version < 3.5, please refer to the [stable documentation](https://github.com/modelscope/ms-swift/blob/v3.4.1/docs/source/Instruction/GRPO.md).
-
 [GRPO (Group Relative Policy Optimization)](https://arxiv.org/abs/2402.03300) leverages intra-group relative advantage calculations to replace the independent value model in the PPO algorithm and directly incorporates KL divergence penalties into the loss function to improve training stability.
 
 ## Algorithm Overview
@@ -38,10 +36,10 @@ completions = rollout_function(
 )
 """
 completions = [
-    (completion 1) "The larger number is 9.11...",
-    (completion 2) "9.9 is bigger than...",
+    (completion 1) "The larger number is 9.9...",
+    (completion 2) "9.11 is bigger than...",
     ...
-    (completion 8) "After calculation, 9.11..."
+    (completion 8) "After calculation, 9.9..."
 ]
 """
 
@@ -49,7 +47,7 @@ completions = [
 # Evaluate generated completions using reward model
 rewards = reward_function(
     completions=completions,
-    ground_truth="9.11"  # Expected correct answer
+    ground_truth="9.9"  # Expected correct answer
 )
 """
 rewards = [
@@ -203,8 +201,11 @@ To configure the external vLLM server during training, use the following paramet
 --vllm_server_timeout <timeout> \
 ```
 
-#### Weight-Sync Acceleration
-Swift 3.10 optimizes weight synchronization, and setting the following parameters can further improve the weight synchronization speed for LoRA training:
+### Weight-Sync Acceleration
+
+Setting the following parameters optimizes weight synchronization speed for LoRA training by syncing only the LoRA adapter weights instead of the full model weights.
+
+> Note: This synchronization method may slightly impact vLLM inference speed.
 
 ```bash
 # rollout(server mode)
@@ -219,13 +220,27 @@ swift rlhf \
     --vllm_mode colocate \
     --vllm_enable_lora true \
     ...
+
+# megatron grpo(colocate mode)
+swift megatron rlhf \
+    --rlhf_type grpo \
+    --vllm_mode colocate \
+    --vllm_enable_lora true \
+    ...
 ```
-Note: This optimization cannot be used in the following cases:
 
-- Training the ViT layers of multimodal models (freeze_vit set to false)
-- MoE models
+**Multimodal ViT LoRA Sync:** If ViT LoRA is enabled during training (`freeze_vit false`),
+tower/connector LoRA support must also be enabled on the vLLM side.
 
-For implementation details, please refer to the [PR](https://github.com/modelscope/ms-swift/pull/5773)
+pass via `vllm_engine_kwargs`:
+
+```bash
+--vllm_engine_kwargs '{"enable_tower_connector_lora": true}'
+```
+
+This is an experimental vLLM feature, currently supporting models such as Qwen2.5-VL and Qwen3-VL.
+For model-specific support details, see the [vLLM documentation](https://docs.vllm.ai/en/latest/features/lora/)
+and the [vLLM issue](https://github.com/vllm-project/vllm/issues/31479).
 
 ## logged metrics
 - completions/mean_length: The average length of generated completions.
@@ -256,7 +271,7 @@ If the `log_entropy` parameter is set, additional entropy-related metrics will b
 If `top_entropy_quantile` is set to a value smaller than 1.0, the entropy threshold value will also be recorded:
 - entropy/threshold: Tokens with entropy below this value will be excluded from the loss calculation.
 
-Training-inference consistency metrics, prefixed with rollout_correction (ms-swift>=3.11), requires setting `log_rollout_offpolicy_metrics=true` or `rollout_importance_sampling_mode`:
+Training-inference consistency metrics, prefixed with rollout_correction, requires setting `log_rollout_offpolicy_metrics=true` or `rollout_importance_sampling_mode`:
 - `kl` / `k3_kl`: KL divergence between training policy and rollout policy (direct estimator / K3 estimator)
 - `training_ppl` / `rollout_ppl`: Perplexity of training policy and rollout policy
 - `log_ppl_diff`: Log PPL difference, reflects the degree of distribution shift
@@ -359,13 +374,7 @@ The algorithm becomes off-policy (near-on-policy) under the following parameter 
 
 Refer to [issue](https://github.com/huggingface/open-r1/issues/239#issuecomment-2646297851).
 
-**6. Why is there a validation process even when `val_dataset` is not set, and how can I disable it?**
-
-When `val_dataset` is not explicitly passed, the `split_dataset_ratio` parameter is responsible for splitting part of the `dataset` into a validation dataset, which defaults to splitting 1% of the data. (In "ms-swift>=3.6", the default value of split_dataset_ratio will be changed from 0.01 to 0.)
-
-To disable the validation process, set `--split_dataset_ratio 0`.
-
-**7. How to set the training `mini-batch size`**
+**6. How to set the training `mini-batch size`**
 
 In GRPO training, we can configure mini-batch updates in the following two ways:
 
@@ -376,13 +385,13 @@ Typical configuration example:
 - When configured with:
 steps_per_generation = 16, gradient_accumulation_steps = 8, mini_batch_size = steps_per_generation / gradient_accumulation_steps = 2. The results from 1 rollout will be split into 2 mini-batch updates.
 
-**8. Difference between swift deploy and swift rollout**
+**7. Difference between swift deploy and swift rollout**
 
 - swift deploy is primarily used for model deployment and inference. It supports various engines such as PT, vLLM, and SGLang, and is compatible with streaming inference as well as the OpenAI API format.
 
 - swift rollout, on the other hand, is dedicated to GRPO rollout acceleration. Currently, it only supports the vLLM engine and comes with built-in automatic weight synchronization.
 
-**9. How to disable the KL loss term**
+**8. How to disable the KL loss term**
 
 Set the parameter `--beta 0` to disable KL loss calculation. The reference model (ref model) will not be loaded in this case.
 

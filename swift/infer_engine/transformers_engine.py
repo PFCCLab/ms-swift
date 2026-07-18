@@ -3,11 +3,14 @@ import asyncio
 import hashlib
 import inspect
 import json
+import os
 import pickle
 import time
 import torch
 import torch.nn.functional as F
+import transformers
 from copy import deepcopy
+from packaging import version
 from PIL import Image
 from queue import Queue
 from threading import Thread
@@ -21,12 +24,15 @@ from swift.metrics import Metric
 from swift.model import get_model_processor
 from swift.template import Template
 from swift.tuners import Swift
-from swift.utils import get_last_valid_indices, safe_snapshot_download, to_device
+from swift.utils import get_last_valid_indices, patch_kernels, safe_snapshot_download, to_device
 from .infer_engine import InferEngine
 from .protocol import (ChatCompletionResponse, ChatCompletionResponseChoice, ChatCompletionResponseStreamChoice,
                        ChatCompletionStreamResponse, ChatMessage, DeltaMessage, EmbeddingResponse,
                        EmbeddingResponseData, InferRequest, RequestConfig, random_uuid)
 from .utils import AdapterRequest, InferStreamer, LogitsStreamer, TokensIteratorStreamer, prepare_generation_config
+
+_TRANSFORMERS_GE_5_2 = version.parse(transformers.__version__) >= version.parse('5.2.0')
+_kernels_patched = False
 
 
 class _GenerationConfig(GenerationConfig):
@@ -60,6 +66,7 @@ class TransformersEngine(InferEngine):
             task_type: Optional[str] = None,
             quantization_config=None,
             model_kwargs: Optional[Dict[str, Any]] = None,
+            template_type: Optional[str] = None,
             # hub kwargs
             use_hf: Optional[bool] = None,
             revision: Optional[str] = None,
@@ -83,9 +90,15 @@ class TransformersEngine(InferEngine):
         self.use_hf = use_hf
         self.revision = revision
         self.hub_token = hub_token
+        global _kernels_patched
+        if _TRANSFORMERS_GE_5_2 and not _kernels_patched:
+            if use_hf is not None and 'USE_HF' not in os.environ:
+                os.environ['USE_HF'] = str(use_hf)
+            patch_kernels()
+            _kernels_patched = True
         if isinstance(model, str):
             self.model, processor = self._get_model_processor(model, **kwargs)
-            template = self._get_template(processor)
+            template = self._get_template(processor, template_type=template_type)
         elif isinstance(model, nn.Module):
             self.model = model
             if template is None:
@@ -216,8 +229,7 @@ class TransformersEngine(InferEngine):
 
     def _infer_stream(self, inputs: Dict[str, Any], *, generation_config: GenerationConfig,
                       adapter_request: Optional[AdapterRequest], request_config: RequestConfig,
-                      **kwargs) -> Iterator[List[Optional[ChatCompletionStreamResponse]]]:
-
+                      template_inputs) -> Iterator[List[Optional[ChatCompletionStreamResponse]]]:
         if generation_config.num_beams != 1:
             error_msg = 'Streaming generation does not support beam search.'
             raise ValueError(error_msg)
@@ -247,7 +259,7 @@ class TransformersEngine(InferEngine):
         batch_size = inputs['attention_mask'].shape[0]
         all_is_finished = False
         is_finished = [False] * batch_size
-        infer_streamers = [InferStreamer(self.template) for _ in range(batch_size)]
+        infer_streamers = [InferStreamer(self.template, template_inputs=template_inputs[i]) for i in range(batch_size)]
         request_id_list = [f'chatcmpl-{random_uuid()}' for _ in range(batch_size)]
         token_idxs = [0] * batch_size
 
@@ -297,7 +309,8 @@ class TransformersEngine(InferEngine):
                 usage_info = self._get_usage_info(num_prompt_tokens, len(generate_ids))
                 toolcall = None
                 if is_finished[i]:
-                    toolcall = self._get_toolcall(self.template.decode(generate_ids))
+                    toolcall = self._get_toolcall(
+                        self.template.decode_generate_ids(generate_ids, template_inputs=template_inputs[i]))
                 finish_reason = self._get_finish_reason(generation_config.max_new_tokens, usage_info.completion_tokens,
                                                         is_finished[i])
 
@@ -421,7 +434,7 @@ class TransformersEngine(InferEngine):
 
                 logprobs = self._get_logprobs(logprobs_list, generate_ids, request_config.top_logprobs)
                 usage_info = self._update_usage_info(usage_info, len(generate_ids))
-                response = self.template.decode(generate_ids, template_inputs=template_inputs[i])
+                response = self.template.decode_generate_ids(generate_ids, template_inputs=template_inputs[i])
                 finish_reason = self._get_finish_reason(generation_config.max_new_tokens, len(generate_ids), True)
                 toolcall = self._get_toolcall(response)
                 token_ids = generate_ids if request_config.return_details else None

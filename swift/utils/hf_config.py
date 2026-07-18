@@ -25,6 +25,14 @@ class HfConfigFactory:
         return torch_dtype
 
     @staticmethod
+    def get_text_config(config):
+        for key in HfConfigFactory.llm_keys:
+            value = getattr(config, key, None)
+            if value is not None:
+                return value
+        return config
+
+    @staticmethod
     def _get_config_attrs(config: Union[PretrainedConfig, Dict[str, Any]],
                           attr_name: str,
                           include_vit: bool = False,
@@ -43,7 +51,7 @@ class HfConfigFactory:
             res.append((config, deep_getattr(config, attr_name)))
 
         for k in keys:
-            if k.endswith('_config'):
+            if k.endswith('_config') and k != 'talker_config':
                 if isinstance(config, dict):
                     v = config[k]
                 else:
@@ -103,10 +111,17 @@ class HfConfigFactory:
         return len(attrs)
 
     @staticmethod
-    def set_model_config_attr(model, attr_name: str, value: Any) -> None:
-        for module in model.modules():
-            if getattr(module, 'config', None) and getattr(module.config, attr_name, value) != value:
-                setattr(module.config, attr_name, value)
+    def del_config_attr(config: Union[PretrainedConfig, Dict[str, Any]],
+                        attr_name: str,
+                        include_vit: bool = False) -> int:
+        """Remove all the attr_name attributes."""
+        attrs = HfConfigFactory._get_config_attrs(config, attr_name, include_vit)
+        for config, _ in attrs:
+            if isinstance(config, dict):
+                config.pop(attr_name, None)
+            elif hasattr(config, attr_name):
+                delattr(config, attr_name)
+        return len(attrs)
 
     @staticmethod
     def get_max_model_len(config: Union[PretrainedConfig, Dict[str, Any]]) -> Optional[int]:
@@ -167,6 +182,7 @@ class HfConfigFactory:
         if torch_dtype is None:
             return None
         if isinstance(torch_dtype, str):
+            torch_dtype = torch_dtype.replace('torch.', '')
             torch_dtype = getattr(torch, torch_dtype)
         return torch_dtype
 

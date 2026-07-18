@@ -42,7 +42,7 @@ class TemplateMeta:
 
     auto_add_bos: bool = False
     stop_words: List[Word] = field(default_factory=list)
-    agent_template: str = 'react_en'
+    agent_template: Optional[str] = None
     # thinking
     is_thinking: bool = False  # Automatically remove think content
     thinking_prefix: str = ''
@@ -69,7 +69,7 @@ class TemplateMeta:
 
     @staticmethod
     def _replace_system(prefix: Prompt) -> Prompt:
-        return [p.replace('{{SYSTEM}}', '') for p in prefix if isinstance(p, str)]
+        return [p.replace('{{SYSTEM}}', '') if isinstance(p, str) else p for p in prefix]
 
     def _check_template_meta(self):
         # check

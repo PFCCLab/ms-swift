@@ -33,6 +33,7 @@ class SglangEngine(InferEngine):
         template: Optional[Template] = None,
         torch_dtype: Optional[torch.dtype] = None,
         model_type: Optional[str] = None,
+        template_type: Optional[str] = None,
         use_hf: Optional[bool] = None,
         hub_token: Optional[str] = None,
         revision: Optional[str] = None,
@@ -83,7 +84,7 @@ class SglangEngine(InferEngine):
         self.log_level = log_level
         if template is None:
             processor = self._get_processor()
-            template = self._get_template(processor)
+            template = self._get_template(processor, template_type=template_type)
         else:
             safe_snapshot_download(
                 model_id_or_path,
@@ -184,7 +185,7 @@ class SglangEngine(InferEngine):
         assert output is not None
         meta_info = output['meta_info']
         usage_info = self._get_usage_info(meta_info['prompt_tokens'], meta_info['completion_tokens'])
-        response = self.template.decode(output['output_ids'])
+        response = self.template.decode_generate_ids(output['output_ids'], template_inputs=inputs['template_inputs'])
         toolcall = self._get_toolcall(response)
         token_ids = output['output_ids'] if return_details else None
         choice = ChatCompletionResponseChoice(
@@ -270,7 +271,7 @@ class SglangEngine(InferEngine):
         engine_inputs = {k: v for k, v in inputs.items() if k != 'template_inputs'}
         result_generator = await self.engine.async_generate(
             **engine_inputs, sampling_params=generation_config, stream=True)
-        infer_streamer = InferStreamer(self.template)
+        infer_streamer = InferStreamer(self.template, template_inputs=inputs['template_inputs'])
         async for output in result_generator:
             res = self._create_chat_completion_stream_response(output, infer_streamer)
             if res is None:
@@ -288,7 +289,8 @@ class SglangEngine(InferEngine):
         toolcall = None
         if is_finished:
             finish_reason = finish_reason['type']
-            toolcall = self._get_toolcall(self.template.decode(output['output_ids']))
+            toolcall = self._get_toolcall(
+                self.template.decode_generate_ids(output['output_ids'], **infer_streamer.decode_kwargs))
         meta_info = output['meta_info']
         usage_info = self._get_usage_info(meta_info['prompt_tokens'], meta_info['completion_tokens'])
         # TODO: logprobs

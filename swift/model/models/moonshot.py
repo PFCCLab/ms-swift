@@ -39,3 +39,19 @@ register_model(
         architectures=['KimiVLForConditionalGeneration'],
         requires=['transformers<4.49'],
     ))
+
+register_model(
+    ModelMeta(
+        MLLMModelType.kimi_k25,
+        [
+            ModelGroup([
+                Model('moonshotai/Kimi-K2.5', 'moonshotai/Kimi-K2.5'),
+                Model('moonshotai/Kimi-K2.6', 'moonshotai/Kimi-K2.6'),
+                Model('moonshotai/Kimi-K2.7-Code', 'moonshotai/Kimi-K2.7-Code'),
+            ])
+        ],
+        template=TemplateType.kimi_k25,
+        model_arch=ModelArch.kimi_k25,
+        architectures=['KimiK25ForConditionalGeneration'],
+        requires=['transformers>=4.57.1,<5.0.0'],
+    ))

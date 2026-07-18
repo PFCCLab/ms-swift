@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from swift.model import MODEL_MAPPING
 from swift.rlhf_trainers import GRPOArgumentsMixin
+from swift.template import TEMPLATE_MAPPING
 from swift.utils import get_current_device, get_logger, is_master, is_mp, json_parse_to_dict, set_default_ddp_config
 from .sft_args import SftArguments
 
@@ -25,12 +26,15 @@ class RewardModelArguments:
             If not specified, it's often inferred. Defaults to None.
         reward_model_revision (Optional[List[str]]): The specific model version to use for the reward model. Same as
             the `model_revision` argument. Defaults to None.
+        reward_template (Optional[List[str]]): The template to use for the reward model. Defaults to None.
     """
     reward_model: Optional[List[str]] = None
     reward_adapters: List[str] = field(default_factory=list)
     reward_model_type: Optional[List[str]] = field(
         default=None, metadata={'help': f'model_type choices: {list(MODEL_MAPPING.keys())}'})
     reward_model_revision: Optional[List[str]] = None
+    reward_template: Optional[List[str]] = field(
+        default=None, metadata={'help': f'template choices: {list(TEMPLATE_MAPPING.keys())}'})
 
 
 @dataclass
@@ -38,8 +42,13 @@ class TeacherModelArguments:
     """Arguments for configuring the teacher model.
 
     Args:
-        teacher_model (Optional[str]): The model ID or a local path to the teacher model. This is required when
-            `rlhf_type` is 'gkd'. Analogous to the main `model` argument. Defaults to None.
+        teacher_model (Optional[str]): The model ID or a local path to the teacher model. Analogous to the main
+            `model` argument. For GKD, there are three modes:
+            - Not set (None): Self-distillation with dynamic teacher (teacher = current student weights).
+            - Same as `model` with LoRA training: Self-distillation with fixed teacher. Automatically optimized
+              to use `disable_adapter()` to get base model logits without loading an extra model.
+            - Different from `model`: Standard GKD with an independent frozen teacher model.
+            Defaults to None.
         teacher_adapters (List[str]): A list of paths to LoRA weights. These weights, often produced by SFT, are loaded
             to form the teacher model. Defaults to an empty list (`[]`).
         teacher_model_type (Optional[str]): The model type of the teacher model. If not specified, it's often inferred.
@@ -50,6 +59,13 @@ class TeacherModelArguments:
             one of the following values: 'zero0', 'zero1', 'zero2', 'zero3', 'zero2_offload', 'zero3_offload'. If not
             provided, it defaults to using the same DeepSpeed configuration as the main training model. Analogous to
             the main `deepspeed` argument.
+        teacher_model_server (Optional[str]): The URL of the teacher model server (e.g., 'http://localhost:8000').
+            When set, the teacher logprobs will be fetched from the external API service (e.g., swift deploy, vLLM)
+            instead of loading a local teacher model. This enables using larger teacher models or services hosted
+            remotely. When this is set, `teacher_model` is not required. Defaults to None.
+        offload_teacher_model (bool): Whether to offload the teacher model to CPU memory to save VRAM during GKD
+            or OPD-RL training. When enabled, the teacher model is loaded to GPU only during forward pass and
+            offloaded back to CPU afterwards. Defaults to False.
     """
     teacher_model: Optional[str] = None
     teacher_adapters: List[str] = field(default_factory=list)
@@ -63,6 +79,23 @@ class TeacherModelArguments:
             'DeepSpeed configuration for teacher model. '
             'Can be a path to a json file or one of: zero0, zero1, zero2, zero3, zero2_offload, zero3_offload'
         })
+    teacher_model_server: Optional[str] = field(
+        default=None,
+        metadata={
+            'help':
+            'URL of the teacher model server (e.g., http://localhost:8000). '
+            'When set, teacher logprobs are fetched via API instead of loading a local model. '
+            'Supports multi-teacher via JSON list of {url, tags}.'
+        })
+    teacher_tag_key: str = field(
+        default='dataset',
+        metadata={
+            'help':
+            'Column name in the dataset used for multi-teacher routing. '
+            'Samples are routed to teachers based on this field\'s value matching teacher "tags". '
+            'Default "dataset" (auto-injected when loading multiple datasets).'
+        })
+    offload_teacher_model: bool = False
 
 
 @dataclass
@@ -195,9 +228,12 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         sft_alpha (float): The weight for the SFT loss component in GKD. The final loss is calculated as
             gkd_loss + sft_alpha * sft_loss`. Defaults to 0.
         lmbda (float): The lambda parameter for GKD, balancing policy and value losses. Defaults to 0.5.
-        seq_kd (bool): Whether to use sequence-level knowledge distillation for GKD. Defaults to False.
-        offload_teacher_model (bool): Whether to offload the teacher model to CPU memory to save VRAM during GKD
-            training. Defaults to False.
+        seq_kd (bool): Deprecated. Sequential KD (teacher-generated responses) is not implemented.
+        gkd_logits_topk (Optional[int]): The number of top-k logits to use for KL divergence computation in GKD.
+            If None, uses full vocabulary for KL computation (more accurate but memory-intensive).
+            If set to a positive integer, only top-k teacher logits are used (more efficient).
+            When using `teacher_model_server`, this is limited by the server's `max_logprobs` setting
+            (vLLM default is 20, can be increased with `--max-logprobs`). Defaults to None.
         max_new_tokens (Optional[int]): A backward-compatibility argument. Please use `max_completion_length` instead.
             Defaults to None.
     """
@@ -232,8 +268,8 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
     # GKD
     sft_alpha: float = 0
     lmbda: float = 0.5
-    seq_kd: bool = False
-    offload_teacher_model: bool = False
+    seq_kd: bool = False  # Deprecated
+    gkd_logits_topk: Optional[int] = None
     # compat
     max_new_tokens: Optional[int] = None  # use max_completion_length instead
 
@@ -254,22 +290,10 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         GRPOArguments.__post_init__(self)
         SftArguments.__post_init__(self)
         self._check_sequence_parallel()
+        self._check_teacher()
         self._check_grpo()
         self._check_gkd()
 
-        if self.loss_scale is None:
-            if self.rlhf_type == 'orpo' and not self.model_meta.is_multimodal:
-                # Avoid padding labels during the model's forward pass in multimodal models.
-                # Some multimodal models do not expand the image pad token.
-                self.loss_scale = 'default'
-            elif self.rlhf_type == 'grpo':
-                if self.loss_scale is None:
-                    if self.multi_turn_scheduler:
-                        self.loss_scale = 'default'
-                    else:
-                        self.loss_scale = 'last_round'
-            else:
-                self.loss_scale = 'last_round'
         if isinstance(self.ref_adapters, str):
             self.ref_adapters = [self.ref_adapters]
         if self.rlhf_type == 'grpo' and self.beta == 0.0:
@@ -280,6 +304,21 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
             self.ref_model_revision = self.ref_model_revision or self.model_revision
         elif self.ref_model is not None:
             raise ValueError('CPO/ORPO or LoRA training does not require a ref_model to be passed in.')
+
+    def _set_loss_scale(self):
+        if self.loss_scale is None:
+            if self.rlhf_type == 'orpo' and not self.model_meta.is_multimodal:
+                # Avoid padding labels during the model's forward pass in multimodal models.
+                # Some multimodal models do not expand the image pad token.
+                self.loss_scale = 'default'
+            elif self.rlhf_type == 'grpo':
+                if self.multi_turn_scheduler:
+                    self.loss_scale = 'default'
+                else:
+                    self.loss_scale = 'last_round'
+            else:
+                self.loss_scale = 'last_round'
+        super()._set_loss_scale()
 
     def _process_loss_type(self):
         if self.loss_type is None:
@@ -343,6 +382,13 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
             else:
                 raise ValueError(f'Invalid advantage_estimator: {self.advantage_estimator}')
 
+        # disable normalization, REAL https://arxiv.org/abs/2602.05630
+        if self.loss_type == 'real':
+            self.scale_rewards = 'none'
+            logger.warning(
+                f"[REAL] scale_rewards='{self.scale_rewards}' is ignored. "
+                "It will be forced to 'none' because 'loss_type = real' does not support reward normalization.")
+
         if self.scale_rewards is None:
             if self.advantage_estimator == 'grpo':
                 self.scale_rewards = 'group'
@@ -353,9 +399,54 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
             else:
                 raise ValueError(f'Invalid advantage_estimator: {self.advantage_estimator}')
 
+    def _check_teacher(self):
+        self._teacher_use_disable_adapter = False
+
+        if self.rlhf_type not in ['grpo', 'gkd']:
+            if self.teacher_model is not None or self.teacher_model_server is not None:
+                logger.warning(f'teacher_model / teacher_model_server is ignored for rlhf_type={self.rlhf_type!r} '
+                               '(only used by gkd and grpo/OPD-RL).')
+            return
+        teacher_set = self.teacher_model is not None or self.teacher_model_server is not None
+        if not teacher_set:
+            if self.rlhf_type == 'gkd':
+                logger.info('No teacher_model specified. Using self-distillation mode (teacher = student).')
+                if self.use_liger_kernel:
+                    raise ValueError('Self-distillation mode with liger kernel loss is not supported yet')
+            if self.rlhf_type == 'grpo' and self.num_generations == 1:
+                raise ValueError('num_generations must be greater than 1 for GRPO')
+            return
+
+        if self.rlhf_type == 'grpo' and self.use_liger_kernel:
+            raise ValueError('OPD-RL is not supported with use_liger_kernel.')
+
+        if self.teacher_model is not None and self.teacher_model_server is not None:
+            raise ValueError('setting both `teacher_model` and `teacher_model_server` is not supported.')
+
+        # Validate teacher_model_server: accept single URL or JSON multi-teacher config.
+        if self.teacher_model_server is not None:
+            from swift.rlhf_trainers.gkd_helpers import parse_teacher_model_server
+
+            # Parse early to fail fast on invalid JSON; result is re-parsed by the trainer.
+            parse_teacher_model_server(self.teacher_model_server)
+
+        # Self-distillation: teacher_model == student model
+        if self.teacher_model is not None and self.teacher_model == self.model:
+            if self.tuner_type == 'lora':
+                logger.info('LoRA + same teacher_model: using disable_adapter() for fixed teacher (no extra model).')
+                self._teacher_use_disable_adapter = True
+                self.teacher_model = None
+            else:
+                # Full training + same teacher_model: a separate frozen copy will be loaded as fixed teacher.
+                pass
+
     def _init_rollout(self):
         if self.rlhf_type not in rlhf_support_vllm_types:
             return
+
+        if self.use_vllm and os.getenv('SWIFT_AUDIO_LOAD_BACKEND') is None:
+            # align with vLLM audio load backend
+            os.environ['SWIFT_AUDIO_LOAD_BACKEND'] = 'soundfile_pyav'
 
         if self.vllm_mode is not None and not self.use_vllm:
             raise ValueError('vllm_mode is not supported when use_vllm is false')
@@ -389,10 +480,12 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         self.max_completion_length = self.max_new_tokens = self.response_length = max_completion_length
 
     def _init_metric_for_best_model(self):
-        if self.rlhf_type not in {'ppo', 'grpo'}:
-            super()._init_metric_for_best_model()
-        elif self.rlhf_type == 'grpo' and self.metric_for_best_model is None:
+        if self.rlhf_type == 'grpo' and self.metric_for_best_model is None:
             self.metric_for_best_model = 'reward'
+        super()._init_metric_for_best_model()
+        if self.rlhf_type == 'ppo':
+            self.metric_for_best_model = None
+            self.greater_is_better = None
 
     def _init_simpo(self):
         if self.rlhf_type != 'simpo':
@@ -482,6 +575,38 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         if self.async_generate and self.multi_turn_scheduler is not None:
             raise NotImplementedError('Currently, async_generate is not supported with multi-turn functionality.')
 
+        self._check_opd_rl()
+
+    def _check_opd_rl(self):
+        """Fail-fast OPD-RL (teacher distillation on GRPO) parameter compatibility.
+
+        A teacher turns GRPO into OPD-RL, where the teacher signal is a *per-token* advantage
+        (the signed teacher log-ratio). Features that require a *per-sequence* advantage (typically
+        sign-based judgments) or reward variance are incompatible; reject them here rather than
+        deep inside the loss / advantage code. ``_check_teacher`` has already run, so
+        ``_teacher_use_disable_adapter`` is resolved.
+        """
+        opd_rl = (
+            self.teacher_model is not None or self.teacher_model_server is not None
+            or self._teacher_use_disable_adapter)
+        if not opd_rl:
+            return
+        # loss types / masks that reduce the advantage to a per-sequence scalar (sign-based).
+        if self.loss_type in ['real', 'fipo']:
+            raise ValueError(f'OPD-RL (teacher) does not support loss_type={self.loss_type!r} '
+                             '(it needs a per-sequence advantage).')
+        if self.off_policy_sequence_mask_delta is not None:
+            raise ValueError('OPD-RL (teacher) does not support off_policy_sequence_mask_delta '
+                             '(it needs a per-sequence advantage).')
+        # Pure distillation (no reward functions): the base GRPO advantage is 0, so reward-variance
+        # driven features have no signal to act on.
+        if not self.reward_funcs:
+            if self.dynamic_sample:
+                raise ValueError('dynamic_sample requires reward_funcs (it filters groups by reward std); '
+                                 'pure OPD-RL distillation has no reward variance.')
+            if self.scale_rewards == 'gdpo':
+                raise ValueError("scale_rewards='gdpo' requires reward_funcs; pure OPD-RL distillation has none.")
+
     def _external_vllm_warning(self):
         if self.rlhf_type not in rlhf_support_vllm_types or not self.vllm_server_host:
             return
@@ -543,3 +668,19 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
 
         if self.async_generate:
             raise NotImplementedError('Currently, async_generate is not supported for GKD.')
+
+        # seq_kd (teacher-generated responses) is not implemented; raise early.
+        if self.seq_kd:
+            raise NotImplementedError('seq_kd=True (Sequential KD with teacher generation) is deprecated.')
+
+        # When using teacher_model_server, gkd_logits_topk is required (API only returns top-k logprobs)
+        if self.teacher_model_server is not None:
+            if self.gkd_logits_topk is None:
+                raise ValueError('gkd_logits_topk is required when using teacher_model_server')
+
+        # Validate gkd_logits_topk
+        if self.gkd_logits_topk is not None and self.gkd_logits_topk <= 0:
+            raise ValueError(f'gkd_logits_topk must be a positive integer, got {self.gkd_logits_topk}')
+
+        if self.gkd_logits_topk is not None and self.use_liger_kernel:
+            raise ValueError('gkd_logits_topk is not supported when using liger kernel')

@@ -8,6 +8,7 @@ from swift.template import get_template
 from swift.utils import get_logger, seed_everything
 
 # os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+# os.environ['ASCEND_RT_VISIBLE_DEVICES'] = '0'
 os.environ['SWIFT_DEBUG'] = '1'
 
 logger = get_logger()
@@ -85,8 +86,8 @@ class TestTemplate(unittest.TestCase):
         tokenizer = get_processor('Qwen/Qwen2.5-7B-Instruct')
         template = get_template(tokenizer)
         for agent_template_type in ('react_zh', 'qwen_zh'):
-            agent_template = agent_template_map[agent_template_type]()
-            template.agent_template = agent_template
+            template._agent_template = agent_template_type
+            agent_template = template.agent_template
             observation = agent_template.keyword.observation
             test_messages = deepcopy(messages)
             test_messages[2]['content'] = 'assistant2' + observation

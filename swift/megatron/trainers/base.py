@@ -10,6 +10,7 @@ import torch.nn
 from abc import ABC, abstractmethod
 from contextlib import contextmanager, nullcontext
 from functools import partial
+from mcore_bridge import LoraParallelLinear
 from megatron.core import mpu
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import finalize_model_grads
@@ -26,26 +27,30 @@ from typing import Callable, Dict, List, Optional
 from swift.dataset import RowPreprocessor
 from swift.megatron.callbacks import megatron_callbacks_map
 from swift.megatron.model import get_mcore_model
-from swift.megatron.tuners import LoraParallelLinear
-from swift.megatron.utils import (copy_original_module_weight, disable_forward_pre_hook, enable_forward_pre_hook,
+from swift.megatron.utils import (apply_router_replay_patch, disable_forward_pre_hook, enable_forward_pre_hook,
                                   get_optimizer_param_scheduler, get_padding_to, init_persistent_async_worker,
                                   initialize_tp_communicators, load_mcore_checkpoint,
                                   logical_and_across_model_parallel_group, maybe_finalize_async_save,
-                                  prepare_mcore_model, reduce_max_stat_across_model_parallel_group,
-                                  save_mcore_checkpoint, should_disable_forward_pre_hook, warmup_jit_function,
-                                  wrap_model)
+                                  prepare_mcore_model, reconstruct_tensor_cp,
+                                  reduce_max_stat_across_model_parallel_group, save_mcore_checkpoint,
+                                  should_disable_forward_pre_hook, warmup_jit_function, wrap_model)
 from swift.template import Template
 from swift.trainers import dynamic_gradient_checkpointing
 from swift.trainers.utils import patch_modelscope_hub_timeout
-from swift.utils import deep_getattr, get_last_valid_indices, get_logger, is_last_rank, is_master, ms_logger_context
+from swift.utils import (deep_getattr, gc_collect, get_current_device, get_last_valid_indices, get_logger, is_last_rank,
+                         is_master, ms_logger_context)
 from .batch_sampler import MegatronPretrainingRandomSampler, MegatronPretrainingSampler
-from .utils import (TrainerState, build_streaming_dataloader, get_batch_on_this_cp_rank, get_batch_on_this_pp_rank,
-                    get_packed_seq_params)
+from .utils import TrainerState, build_streaming_dataloader, prepare_batch
 
 try:
     from megatron.core.optimizer import param_group_identifier_keys
+    from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 except ImportError:
     param_group_identifier_keys = None
+    RouterReplay = None
+    RouterReplayAction = None
+
+mcore_016 = version.parse(megatron.core.__version__) >= version.parse('0.16.0rc0')
 
 logger = get_logger()
 
@@ -53,11 +58,20 @@ logger = get_logger()
 class BaseMegatronTrainer(ABC):
 
     def __init__(self, args, template: Template):
+        # validate mcore version and patch routing_replay
+        self.enable_routing_replay = args.router_replay_mode != 'disabled'
+        if self.enable_routing_replay:
+            apply_router_replay_patch()
+
         self.args = args
         self.template = template
-        self.bridge = args.megatron_model_meta.bridge_cls(args)
         self.prepare_model()
-        self.config = self.unwrapped_models[0].config
+        # Sync template.padding_free after prepare_model(), because _check_padding_free
+        # may override args.padding_free for certain models (e.g. DSA attention).
+        if template.padding_free != args.padding_free:
+            logger.warning(f'template.padding_free({template.padding_free}) != args.padding_free({args.padding_free}), '
+                           f'syncing template.padding_free to {args.padding_free}.')
+            template.padding_free = args.padding_free
         self.optimizer, self.opt_param_scheduler = self.get_optimizer_and_scheduler()
         self.data_collator = self._get_data_collator()
 
@@ -66,9 +80,6 @@ class BaseMegatronTrainer(ABC):
         if initialize_embedding:
             for m in self.unwrapped_models:
                 self._initialize_embedding(m)
-        if args.tuner_type != 'full' and args.modules_to_save:
-            for m in self.unwrapped_models:
-                copy_original_module_weight(m)
         self._load_checkpoint()
 
         self.eval_metrics = None
@@ -83,8 +94,6 @@ class BaseMegatronTrainer(ABC):
                 })
                 check_local_model_is_latest(args.model_info.model_dir, user_agent=config_info)
 
-        self.mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
-        self.mcore_014 = version.parse(megatron.core.__version__) >= version.parse('0.14.0rc0')
         self.callbacks = []
         for callback in args.callbacks:
             self.callbacks.append(megatron_callbacks_map[callback](self))
@@ -118,6 +127,7 @@ class BaseMegatronTrainer(ABC):
         self._log_callback(logs, n_steps)
         if prefix:
             logs = {f'{prefix}{k}': v for k, v in logs.items()}
+        self._last_logged_metrics = dict(logs)
         self.call_event('on_log', logs=logs)
 
     def _log_callback(self, logs, n_steps):
@@ -126,18 +136,17 @@ class BaseMegatronTrainer(ABC):
         if config.num_moe_experts is not None:
             moe_loss_scale = 1 / args.num_microbatches / n_steps
             track_names = []
-            if config.moe_router_load_balancing_type == 'aux_loss':
+            load_balancing_type = config.moe_router_load_balancing_type
+            if isinstance(load_balancing_type, str):
+                load_balancing_type = [load_balancing_type]
+            if 'aux_loss' in load_balancing_type:
                 track_names.append('load_balancing_loss')
-            elif config.moe_router_load_balancing_type == 'seq_aux_loss':
-                if self.mcore_014:
-                    track_names.append('seq_load_balancing_loss')
-                else:
-                    track_names.append('load_balancing_loss')
-            elif config.moe_router_load_balancing_type == 'global_aux_loss':
+            if 'seq_aux_loss' in load_balancing_type:
+                track_names.append('seq_load_balancing_loss')
+            if 'global_aux_loss' in load_balancing_type:
                 track_names.append('global_load_balancing_loss')
             if config.moe_z_loss_coeff is not None:
                 track_names.append('z_loss')
-            track_moe_kwargs = {'mtp_num_layers': args.mtp_num_layers} if self.mcore_013 else {}
             track_moe_metrics(
                 loss_scale=moe_loss_scale,
                 iteration=self.state.iteration,
@@ -147,12 +156,26 @@ class BaseMegatronTrainer(ABC):
                 track_names=track_names,
                 num_layers=config.num_layers,
                 moe_layer_freq=config.moe_layer_freq,
-                **track_moe_kwargs)
+                mtp_num_layers=args.mtp_num_layers)
         if args.mtp_num_layers is not None:
             mtp_loss_scale = 1 / args.num_microbatches / n_steps
             mtp_logs = {}
             MTPLossLoggingHelper.track_mtp_metrics(mtp_loss_scale, self.state.iteration, None, None, mtp_logs)
             logs.update({k.replace(' ', '_'): v for k, v in mtp_logs.items()})
+        # Track sparse attention indexer loss.
+        if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
+            from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
+            indexer_loss_scale = 1 / args.num_microbatches / n_steps
+            idx_logs = {}
+            DSAIndexerLossLoggingHelper.track_indexer_metrics(
+                loss_scale=indexer_loss_scale,
+                iteration=self.state.iteration,
+                writer=None,
+                wandb_writer=None,
+                total_loss_dict=idx_logs,
+            )
+            logs.update({k.replace(' ', '_'): v for k, v in idx_logs.items()})
+
         for k, v in logs.items():
             if isinstance(v, torch.Tensor):
                 if v.numel() == 2:
@@ -162,8 +185,10 @@ class BaseMegatronTrainer(ABC):
 
     def prepare_model(self):
         args = self.args
-        self.wrapped_models = []
         self.unwrapped_models = get_mcore_model(args, self.template.config)
+        self.config = self.unwrapped_models[0].config
+        logger.info(f'model_config: {self.config}')
+        self.bridge = self.config.bridge
         self.peft_models = self._prepare_peft_model(self.unwrapped_models)
         self.wrapped_models = wrap_model(args, self.unwrapped_models)
 
@@ -174,22 +199,51 @@ class BaseMegatronTrainer(ABC):
         peft_models = [prepare_mcore_model(args, model) for model in models]
         if args.tuner_type == 'lora' and args.adapters and args.mcore_adapter is None:
             assert len(args.adapters) == 1, 'Currently only support one adapter.'
-            self.bridge.load_weights(models, args.adapters[0], is_peft_format=True, adapter_name='default')
+            self.bridge.load_weights(models, args.adapters[0], peft_format=True, adapter_name='default')
         return peft_models
 
     def get_optimizer_and_scheduler(self):
         args = self.args
-        kwargs = {}
-        for f in dataclasses.fields(OptimizerConfig):
-            if hasattr(args, f.name) and f.name != 'loss_scale':
-                kwargs[f.name] = getattr(args, f.name)
-        config = OptimizerConfig(**kwargs)
+        if mcore_016:
+            from megatron.core.optimizer import AdamOptimizerConfig, SGDOptimizerConfig
+            if args.optimizer == 'adam' or 'muon' in args.optimizer:
+                # TODO(deyuf): Muon needs both adam + muon but get() only receive one config
+                # So for now we keep using adam config that's back compat with old way
+                config_cls = AdamOptimizerConfig
+            elif args.optimizer == 'sgd':
+                config_cls = SGDOptimizerConfig
+            else:
+                raise ValueError(f'Invalid optimizer type: {args.optimizer}')
+        else:
+            config_cls = OptimizerConfig
+
+        kwargs = {
+            f.name: getattr(args, f.name)
+            for f in dataclasses.fields(config_cls) if hasattr(args, f.name) and f.name != 'loss_scale'
+        }
+        config = config_cls(**kwargs)
+
         if args.apply_wd_to_qk_layernorm or self.args.vit_lr is not None or self.args.aligner_lr is not None:
             param_groups_context = self._patch_get_param_groups()
         else:
             param_groups_context = nullcontext()
         with param_groups_context:
-            optimizer = get_megatron_optimizer(config, self.wrapped_models)
+
+            if 'muon' not in config.optimizer:
+                # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
+                # to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
+                # default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
+                optimizer = get_megatron_optimizer(
+                    config,
+                    self.wrapped_models,
+                )
+            else:
+                from megatron.core.optimizer.muon import get_megatron_muon_optimizer
+                optimizer = get_megatron_muon_optimizer(
+                    config,
+                    self.wrapped_models,
+                    layer_wise_distributed_optimizer='dist' in config.optimizer,
+                )
         opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
         return optimizer, opt_param_scheduler
 
@@ -224,6 +278,23 @@ class BaseMegatronTrainer(ABC):
                 # Note that this approach will train for one additional step.
                 logger.info(f'Training of {epoch} epochs has been completed, the training has finished.')
                 args.train_iters = self.state.iteration + 1
+
+    def _get_param_groups_mcore_016(
+        self,
+        model_chunks: List[MegatronModule],
+        config: OptimizerConfig,
+        config_overrides,
+    ) -> List[Dict]:
+        return self._get_param_groups(
+            model_chunks,
+            no_weight_decay_cond=None,
+            scale_lr_cond=None,
+            lr_mult=1.,
+            lr=config.lr,
+            min_lr=config.min_lr,
+            decoupled_lr=config.decoupled_lr,
+            decoupled_min_lr=config.decoupled_min_lr,
+        )
 
     # Code borrowed from Megatron-LM
     def _get_param_groups(
@@ -264,8 +335,9 @@ class BaseMegatronTrainer(ABC):
         Returns:
             List of parameter groups.
         """
-        from megatron.core.optimizer import _update_min_and_max_lr_in_param_groups
         args = self.args
+        if decoupled_min_lr is None:
+            decoupled_min_lr = min_lr
         is_multimodal = args.megatron_model_meta.is_multimodal
         if args.vit_lr is not None or args.aligner_lr is not None:
             assert is_multimodal, 'vit_lr and aligner_lr are only supported for multimodal models.'
@@ -365,22 +437,31 @@ class BaseMegatronTrainer(ABC):
                 assert set(param_group.keys()) - set(param_group_identifier_keys) == {'params'}
             param_groups.append(param_group)
 
-        param_groups = _update_min_and_max_lr_in_param_groups(
-            param_groups,
-            lr=lr,
-            min_lr=min_lr,
-            decoupled_lr=decoupled_lr,
-            decoupled_min_lr=decoupled_min_lr,
-        )
-
+        # Update min and max lr in param groups
+        # These changes are compatible with mcore 0.16.
+        for param_group in param_groups:
+            if param_group['is_decoupled_lr']:
+                assert decoupled_lr is not None
+                param_group['max_lr'] = decoupled_lr
+                param_group['min_lr'] = decoupled_min_lr
+            else:
+                param_group['max_lr'] = lr
+                param_group['min_lr'] = min_lr
+            lr_mult = param_group.pop('lr_mult')
+            # Instead of using lr_mult to control the learning rate, we directly use max_lr/min_lr.
+            param_group['lr_mult'] = 1.
+            param_group['max_lr'] *= lr_mult
+            param_group['min_lr'] *= lr_mult
         return param_groups
 
     @contextmanager
     def _patch_get_param_groups(self):
         from megatron.core import optimizer
-
         _get_param_groups = optimizer._get_param_groups
-        optimizer._get_param_groups = self._get_param_groups
+        if mcore_016:
+            optimizer._get_param_groups = self._get_param_groups_mcore_016
+        else:
+            optimizer._get_param_groups = self._get_param_groups
         try:
             yield
         finally:
@@ -391,7 +472,7 @@ class BaseMegatronTrainer(ABC):
         ckpt_dir = None
         if args.tuner_type == 'full':
             ckpt_dir = args.model
-        elif args.tuner_type == 'lora':
+        else:
             ckpt_dir = args.adapters[0] if args.adapters else args.model
         if ckpt_dir is None:
             return 0
@@ -422,7 +503,8 @@ class BaseMegatronTrainer(ABC):
             if self.args.vit_gradient_checkpointing:
                 dynamic_gradient_checkpointing(module, False)
                 try:
-                    module.gradient_checkpointing_enable(**(self.args.gradient_checkpointing_kwargs or {}))
+                    module.gradient_checkpointing_enable(
+                        gradient_checkpointing_kwargs=self.args.vit_gradient_checkpointing_kwargs)
                     module.enable_input_require_grads()
                 except AttributeError:
                     pass
@@ -500,10 +582,10 @@ class BaseMegatronTrainer(ABC):
             val_data_iterator = iter(self.cyclic_iter(val_dataloader, use_origin_cyclic=use_origin_cyclic))
         return train_data_iterator, val_data_iterator
 
-    def train(self, train_dataset, val_dataset):
+    def setup_model_training(self):
         args = self.args
         config = self.config
-        state = self.state
+
         for m in self.wrapped_models:
             m.train()
 
@@ -527,21 +609,51 @@ class BaseMegatronTrainer(ABC):
             if len(self.wrapped_models) == 1:
                 config.param_sync_func = config.param_sync_func[0]
         config.finalize_model_grads_func = finalize_model_grads
-        start_iteration = state.iteration
-        pre_hook_enabled = False
-        # Disable forward pre-hook to start training to ensure that errors in checkpoint loading
-        # or random initialization don't propagate to all ranks in first all-gather (which is a
-        # no-op if things work correctly).
+
+        self._start_iteration = self.state.iteration
+        self._pre_hook_enabled = False
         if should_disable_forward_pre_hook(args):
             disable_forward_pre_hook(self.wrapped_models, param_sync=False)
-            # Also remove param_sync_func temporarily so that sync calls made in
-            # `forward_backward_func` are no-ops.
-            param_sync_func = config.param_sync_func
+            self._saved_param_sync_func = config.param_sync_func
             config.param_sync_func = None
-            pre_hook_enabled = False
+
+        if args.nccl_comm_warmup:
+            # Eagerly create NCCL communicators while GPU memory is still free. Lazily-initialized
+            # comms (e.g. the dp/cp loss all-reduce and grad-sync coalescing) otherwise first fire
+            # at the iteration-1 memory peak, where NCCL's internal cudaMalloc can fail with
+            # "Failed to CUDA calloc async N bytes". A 1-element dummy all-reduce per group is
+            # numerically inert and forces the communicator to be created up front.
+            dummy = torch.zeros(1, device=get_current_device())
+            warmed = 0
+            for getter, kwargs in (
+                (mpu.get_data_parallel_group, {
+                    'with_context_parallel': True
+                }),
+                (mpu.get_data_parallel_group, {}),
+                (mpu.get_context_parallel_group, {}),
+                (mpu.get_tensor_model_parallel_group, {}),
+                (mpu.get_pipeline_model_parallel_group, {}),
+                (mpu.get_model_parallel_group, {}),
+                (mpu.get_embedding_group, {}),
+                (mpu.get_position_embedding_group, {}),
+            ):
+                try:
+                    group = getter(**kwargs)
+                except (AssertionError, ValueError, TypeError):
+                    continue
+                for g in (group if isinstance(group, list) else [group]):
+                    if g is not None:
+                        torch.distributed.all_reduce(dummy, group=g)
+                        warmed += 1
+            torch.cuda.synchronize()
+            logger.info(f'NCCL communicator warm-up done ({warmed} groups).')
 
         self.call_event('on_train_begin')
-        train_metrics = {}
+        self._train_metrics = {}
+
+    def setup_training(self, train_dataset, val_dataset):
+        self.setup_model_training()
+        args = self.args
         if args.virtual_pipeline_model_parallel_size is not None:
             train_data_iterator, val_data_iterator = [], []
             for _ in range(args.virtual_pipeline_model_parallel_size):
@@ -550,72 +662,96 @@ class BaseMegatronTrainer(ABC):
                 val_data_iterator.append(val_it)
         else:
             train_data_iterator, val_data_iterator = self._prepare_data_iterator(train_dataset, val_dataset)
-        while state.iteration < args.train_iters:
-            self.call_event('on_step_begin')
-            maybe_finalize_async_save(args, blocking=False)
-            metrics, grad_norm, update_successful = self.train_step(train_data_iterator)
-            if state.iteration == start_iteration:
-                if update_successful:
-                    # Enable forward pre-hook after training step has successfully run. All subsequent
-                    # forward passes will use the forward pre-hook / `param_sync_func` in
-                    # `forward_backward_func`.
-                    if should_disable_forward_pre_hook(args):
-                        enable_forward_pre_hook(self.wrapped_models)
-                        config.param_sync_func = param_sync_func
-                        pre_hook_enabled = True
-                else:
-                    start_iteration = state.iteration + 1
+        return train_data_iterator, val_data_iterator
 
-            state.iteration += 1
-            self.call_event('on_step_end')
-            self._aggregated_metrics(metrics, train_metrics)
-            train_metrics['grad_norm'] = grad_norm
-            learning_rate = None
-            for param_group in self.optimizer.param_groups:
-                if len(param_group['params']) == 0:
-                    continue
-                learning_rate = param_group['lr']
-            if learning_rate is not None:
-                train_metrics['learning_rate'] = learning_rate
-            if state.should_log:
-                state.should_log = False
-                self.on_log(logs=train_metrics)
-                train_metrics = {}
+    def run_train_step(self, train_data_iterator, val_data_iterator):
+        """Execute one training iteration including logging / eval / save.
 
-            eval_metrics = None
-            if state.should_eval:
-                state.should_eval = False
-                if should_disable_forward_pre_hook(args):
-                    disable_forward_pre_hook(self.wrapped_models)
-                    pre_hook_enabled = False
-                eval_metrics = self.evaluate(val_data_iterator)
-                for m in self.wrapped_models:
-                    m.train()
+        Returns ``True`` if training should continue, ``False`` if done.
+        """
+        args = self.args
+        config = self.config
+        state = self.state
+
+        self.call_event('on_step_begin')
+        maybe_finalize_async_save(args, blocking=False)
+        metrics, grad_norm, update_successful = self.train_step(train_data_iterator)
+
+        if state.iteration == self._start_iteration:
+            if update_successful:
                 if should_disable_forward_pre_hook(args):
                     enable_forward_pre_hook(self.wrapped_models)
-                    pre_hook_enabled = True
+                    config.param_sync_func = self._saved_param_sync_func
+                    self._pre_hook_enabled = True
+            else:
+                self._start_iteration = state.iteration + 1
 
-            if state.should_save:
-                self._determine_best_metric(eval_metrics)
-                if should_disable_forward_pre_hook(args):
-                    disable_forward_pre_hook(self.wrapped_models)
-                state.should_save = False
-                self.save_checkpoint()
-                if should_disable_forward_pre_hook(args):
-                    enable_forward_pre_hook(self.wrapped_models)
+        state.iteration += 1
+        self.call_event('on_step_end')
+        self._aggregated_metrics(metrics, self._train_metrics)
+        self._train_metrics['grad_norm'] = grad_norm
+        for param_group in self.optimizer.param_groups:
+            if len(param_group['params']) == 0:
+                continue
+            self._train_metrics['learning_rate'] = param_group['lr']
+            break
+        if state.should_log:
+            state.should_log = False
+            self.on_log(logs=self._train_metrics)
+            self._train_metrics = {}
 
+        eval_metrics = None
+        if state.should_eval:
+            state.should_eval = False
+            if should_disable_forward_pre_hook(args):
+                disable_forward_pre_hook(self.wrapped_models)
+                self._pre_hook_enabled = False
+            eval_metrics = self.evaluate(val_data_iterator)
+            for m in self.wrapped_models:
+                m.train()
+            if should_disable_forward_pre_hook(args):
+                enable_forward_pre_hook(self.wrapped_models)
+                self._pre_hook_enabled = True
+
+        if state.should_save:
+            self._determine_best_metric(eval_metrics)
+            if should_disable_forward_pre_hook(args):
+                disable_forward_pre_hook(self.wrapped_models)
+            state.should_save = False
+            self.save_checkpoint()
+            self.call_event('on_save', output_dir=self.state.last_model_checkpoint)
+            if should_disable_forward_pre_hook(args):
+                enable_forward_pre_hook(self.wrapped_models)
+
+        return state.iteration < args.train_iters
+
+    def finalize_training(self):
+        """Cleanup after training loop completes."""
         self.call_event('on_train_end')
-        # Close out pre-hooks if using distributed optimizer and overlapped param gather.
-        if pre_hook_enabled:
+        if self._pre_hook_enabled:
             disable_forward_pre_hook(self.wrapped_models)
-        maybe_finalize_async_save(args, blocking=True, terminate=True)
+        maybe_finalize_async_save(self.args, blocking=True, terminate=True)
+
+    def train(self, train_dataset, val_dataset):
+        train_data_iterator, val_data_iterator = self.setup_training(train_dataset, val_dataset)
+        while self.state.iteration < self.args.train_iters:
+            self.run_train_step(train_data_iterator, val_data_iterator)
+        self.finalize_training()
 
     def _determine_best_metric(self, metrics) -> bool:
         args = self.args
         state = self.state
         if (args.metric_for_best_model is None or metrics is None or not is_last_rank()
                 or args.metric_for_best_model not in metrics):
-            return False
+            if args.metric_for_best_model is None:
+                return False
+            tensor = torch.zeros((3, ), device=get_current_device(), dtype=torch.float64)
+            torch.distributed.all_reduce(tensor)
+            is_new_best_metric = bool(tensor[2].item())
+            if is_new_best_metric:
+                state.best_metric = tensor[0].item()
+                state.best_global_step = int(tensor[1].item())
+            return is_new_best_metric
         metric_value = metrics[args.metric_for_best_model]
         op = operator.ge if args.greater_is_better else operator.le
         if state.best_metric is None:
@@ -626,6 +762,10 @@ class BaseMegatronTrainer(ABC):
             state.best_metric = metric_value
             state.best_global_step = state.global_step
             is_new_best_metric = True
+        tensor = torch.tensor([state.best_metric, state.best_global_step, is_new_best_metric],
+                              device=get_current_device(),
+                              dtype=torch.float64)
+        torch.distributed.all_reduce(tensor)
         return is_new_best_metric
 
     def save_checkpoint(self):
@@ -637,28 +777,39 @@ class BaseMegatronTrainer(ABC):
         os.makedirs(output_dir, exist_ok=True)
         args_path = os.path.join(os.path.dirname(output_dir), 'args.json')
         self.copy_path(args_path, os.path.join(output_dir, 'args.json'))
-        save_peft_format = args.tuner_type == 'lora' and not args.merge_lora
         if args.save_safetensors and args.no_save_optim:
             model = []
         else:
             model = self.wrapped_models
+        gc_collect()
         save_mcore_checkpoint(
             args,
             model,
             self.optimizer,
             self.opt_param_scheduler,
             iteration=iteration,
-            is_peft_format=args.tuner_type == 'lora',
+            peft_format=args.tuner_type == 'lora',
             output_dir=output_dir)
         state.last_model_checkpoint = output_dir
-        if state.best_global_step:
+        if state.best_global_step is not None:
             best_model_checkpoint = os.path.join(args.output_dir, f'checkpoint-{state.best_global_step}')
             if os.path.exists(best_model_checkpoint):
                 state.best_model_checkpoint = best_model_checkpoint
         # safetensors
         if args.save_safetensors:
+            skip_saving_adapter = args.tuner_type == 'lora_llm' or (
+                args.tuner_type == 'lora' and args.merge_lora and not hasattr(self.bridge, '_support_hf_grouped_lora'))
+
+            if not skip_saving_adapter:
+                self.bridge.save_weights(
+                    self.unwrapped_models,
+                    output_dir,
+                    peft_format=args.tuner_type == 'lora',
+                    args=args,
+                    processor=self.template.processor,
+                )
             # merge-lora does not store lora, lora saving may report an error (Qwen3-VL-Moe)
-            if args.tuner_type == 'lora' and args.merge_lora:
+            if args.tuner_type != 'full' and args.merge_lora:
                 self.merge_lora_adapters()
                 origin_output_dir = output_dir
                 output_dir = f'{output_dir}-merged'
@@ -671,13 +822,13 @@ class BaseMegatronTrainer(ABC):
                 tgt_common_path = os.path.join(output_dir, f'iter_{iteration:07d}', 'common.pt')
                 os.makedirs(os.path.dirname(tgt_common_path), exist_ok=True)
                 self.copy_path(common_path, tgt_common_path)
-            self.bridge.save_weights(
-                self.unwrapped_models,
-                output_dir,
-                is_peft_format=save_peft_format,
-                processor=self.template.processor,
-                hf_config=self.template.config)
-            if args.tuner_type == 'lora' and args.merge_lora:
+                self.bridge.save_weights(
+                    self.unwrapped_models,
+                    output_dir,
+                    peft_format=False,
+                    args=args,
+                    processor=self.template.processor,
+                )
                 self.unmerge_lora_adapters()
 
         if is_master():
@@ -751,7 +902,7 @@ class BaseMegatronTrainer(ABC):
         return eval_metrics
 
     def compute_eval_metrics(self, metrics):
-        if self.eval_metrics is not None:
+        if self.eval_metrics is not None and mpu.is_pipeline_last_stage():
             metric = self.eval_metrics.compute()
             for k, v in metric.items():
                 metrics[k] = v if isinstance(v, torch.Tensor) else torch.tensor(v)
@@ -768,6 +919,10 @@ class BaseMegatronTrainer(ABC):
         self.optimizer.zero_grad()
         # TODO: refactor _replace_data_iterator
         data_iterator = self._replace_data_iterator(train_data_iterator)
+
+        if self.enable_routing_replay:
+            RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+
         metrics = forward_backward_func(
             forward_step_func=self.forward_step,
             data_iterator=data_iterator,
@@ -783,6 +938,10 @@ class BaseMegatronTrainer(ABC):
         grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
         if update_successful:
             self.opt_param_scheduler.step(increment=args.global_batch_size)
+
+        if self.enable_routing_replay:
+            RouterReplay.clear_global_router_replay_action()
+            RouterReplay.clear_global_indices()
 
         return metrics, grad_norm, update_successful
 
@@ -856,21 +1015,8 @@ class BaseMegatronTrainer(ABC):
     def forward_step(self, data_iterator, model):
         pass
 
-    def _prepare_batch(self, data, vp_stage=None, num_samples=None):
-        batch = get_batch_on_this_pp_rank(self.args, data, vp_stage=vp_stage)
-        if num_samples is None:
-            num_samples = batch.pop('num_samples')
-        args = self.args
-        text_position_ids = batch.pop('text_position_ids', None)
-        batch.pop('attention_mask_2d', None)
-        if text_position_ids is None:
-            text_position_ids = batch.get('position_ids')
-        if args.padding_free and text_position_ids is not None:
-            batch['packed_seq_params'] = get_packed_seq_params(text_position_ids)
-            batch['packed_seq_params'].num_samples = num_samples
-        # slice batch along sequence dimension for context parallelism
-        batch = get_batch_on_this_cp_rank(args, batch)
-        return batch
+    def _prepare_batch(self, data, vp_stage=None):
+        return prepare_batch(self.args, data, vp_stage=vp_stage)
 
     def get_batch(self, data_iterator, vp_stage=None):
         """Generate a batch."""
@@ -897,12 +1043,17 @@ class BaseMegatronTrainer(ABC):
                 }
         return {}
 
-    def get_last_tokens(self, output_tensor, packed_seq_params=None, attention_mask=None, num_samples=None):
+    def get_last_tokens(self, output_tensor, packed_seq_params=None, attention_mask=None):
+        if self.args.context_parallel_size > 1:
+            output_tensor = reconstruct_tensor_cp(output_tensor, packed_seq_params, dim=1)
         if packed_seq_params is None:
-            last_token_idx = get_last_valid_indices((~attention_mask[:, 0, -1]).long())
+            # Compatible with attention_mask_2d
+            if attention_mask.dim() > 2:
+                attention_mask = (~attention_mask).sum(dim=(1, 2)) > 0
+            last_token_idx = get_last_valid_indices(attention_mask.long())
             last_tokens = output_tensor[torch.arange(output_tensor.shape[0]), last_token_idx]
         else:
-            num_samples = num_samples or packed_seq_params.num_samples
-            last_token_idx = packed_seq_params.cu_seqlens_q[1:num_samples + 1] - 1
+            num_samples = packed_seq_params.seq_lens.shape[0]
+            last_token_idx = packed_seq_params.cu_seqlens_q[:num_samples] + packed_seq_params.seq_lens - 1
             last_tokens = output_tensor[0, last_token_idx]
         return last_tokens

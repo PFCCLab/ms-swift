@@ -1,10 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import sys
+import torch
 from transformers import AutoModel, PretrainedConfig, PreTrainedModel
 from typing import Any, Dict
 
 from swift.template import TemplateType
-from swift.utils import Processor, git_clone_github
+from swift.utils import Processor, get_logger, git_clone_github
 from ..constant import LLMModelType, MLLMModelType
 from ..model_arch import ModelArch
 from ..model_meta import Model, ModelGroup, ModelMeta
@@ -18,7 +19,7 @@ class DeepseekLoader(ModelLoader):
     def get_model(self, model_dir: str, *args, **kwargs) -> PreTrainedModel:
         model = super().get_model(model_dir, *args, **kwargs)
         # fix dtype bug
-        mlp_cls = model.model.layers[1].mlp.__class__
+        mlp_cls = model.model.layers[-1].mlp.__class__
 
         for module in model.modules():
             if isinstance(module, mlp_cls):
@@ -140,7 +141,7 @@ class DeepseekV32Loader(ModelLoader):
             from transformers.models.deepseek_v32 import DeepseekV32ForCausalLM
         except ImportError:
             # It’s only for compatibility with Megatron training or vllm/sglang infer,
-            # while we wait for Transformers to support deepseek_v3_2.
+            # while we wait for Transformers to support deepseek_v32.
             from transformers.models.deepseek_v3 import DeepseekV3ForCausalLM as DeepseekV32ForCausalLM
             if not self.return_dummy_model:
                 raise ValueError('DeepSeek-V3.2 is not supported in transformers.')
@@ -150,7 +151,7 @@ class DeepseekV32Loader(ModelLoader):
 
 register_model(
     ModelMeta(
-        LLMModelType.deepseek_v3_2,
+        LLMModelType.deepseek_v32,
         [
             ModelGroup([
                 Model('deepseek-ai/DeepSeek-V3.2', 'deepseek-ai/DeepSeek-V3.2'),
@@ -163,6 +164,23 @@ register_model(
         DeepseekV32Loader,
         template=TemplateType.deepseek_v3_1,
         architectures=['DeepseekV32ForCausalLM'],
+    ))
+
+register_model(
+    ModelMeta(
+        LLMModelType.deepseek_v4,
+        [
+            ModelGroup([
+                Model('deepseek-ai/DeepSeek-V4-Flash', 'deepseek-ai/DeepSeek-V4-Flash'),
+                Model('deepseek-ai/DeepSeek-V4-Flash-Base', 'deepseek-ai/DeepSeek-V4-Flash-Base'),
+            ]),
+            ModelGroup([
+                Model('deepseek-ai/DeepSeek-V4-Pro', 'deepseek-ai/DeepSeek-V4-Pro'),
+                Model('deepseek-ai/DeepSeek-V4-Pro-Base', 'deepseek-ai/DeepSeek-V4-Pro-Base'),
+            ]),
+        ],
+        template=TemplateType.deepseek_v4,
+        architectures=['DeepseekV4ForCausalLM'],
     ))
 
 
@@ -355,6 +373,137 @@ register_model(
         template=TemplateType.deepseek_ocr2,
         model_arch=ModelArch.deepseek_ocr2,
         architectures=['DeepseekOCR2ForCausalLM'],
+        requires=['transformers==4.46.3', 'easydict'],
+        tags=['vision'],
+    ))
+
+
+class UnlimitedOCRLoader(DeepseekOCRLoader):
+    visual_name = 'vision_model'
+
+    @staticmethod
+    def _apply_multi_gpu_patch():
+        """
+        Fixed two bugs affecting `UnlimitedOCRModel` in multi-GPU scenarios using `device_map='auto'`:
+
+        Bug 1 - Device mismatch in `torch.cat`:
+            `image_newline` and `view_seperator` are `nn.Parameter`s;
+            under `device_map='auto'`, their device placement might not align
+            with the image features.
+
+        Bug 2 - Device mismatch in `masked_scatter_`:
+            Hard-coded `.cuda()` usage caused a conflict where `images_in_this_batch`
+            resided on the projector's device (e.g., `cuda:7`),
+            while `inputs_embeds` resided on the device hosting `embed_tokens` (e.g., `cuda:0`).
+
+        Fix strategy: Temporarily replace `torch.cat` and `torch.Tensor.masked_scatter_` during the forward pass
+        to handle device placement automatically, then restore the original methods after execution.
+        """
+        modeling_module = None
+        for mod_name, mod in sys.modules.items():
+            if 'modeling_unlimitedocr' in mod_name:
+                modeling_module = mod
+                break
+
+        if modeling_module is None:
+            return False
+
+        UnlimitedOCRModel = getattr(modeling_module, 'UnlimitedOCRModel', None)
+        if UnlimitedOCRModel is None:
+            return False
+
+        # Avoid redundant patching
+        if getattr(UnlimitedOCRModel, '_swift_multi_gpu_patched', False):
+            return True
+
+        _original_forward = UnlimitedOCRModel.forward
+
+        def _patched_forward(self, *args, **kwargs):
+            _orig_cat = torch.cat
+            _orig_masked_scatter_ = torch.Tensor.masked_scatter_
+
+            def _safe_cat(tensors, dim=0, **cat_kwargs):
+                # Using the device of the first tensor as the reference, the others are aligned to it.
+                ref_device = None
+                for t in tensors:
+                    if isinstance(t, torch.Tensor):
+                        ref_device = t.device
+                        break
+                if ref_device is None:
+                    return _orig_cat(tensors, dim, **cat_kwargs)
+                aligned = [
+                    t.to(ref_device) if isinstance(t, torch.Tensor) and t.device != ref_device else t for t in tensors
+                ]
+                return _orig_cat(aligned, dim, **cat_kwargs)
+
+            def _safe_masked_scatter_(tensor_self, mask, source):
+                # Use the device of tensor_self (inputs_embeds[idx]) as the reference.
+                dev = tensor_self.device
+                if mask.device != dev:
+                    mask = mask.to(dev)
+                if source.device != dev:
+                    source = source.to(dev)
+                return _orig_masked_scatter_(tensor_self, mask, source)
+
+            # Simultaneously replace the module namespace and the global scope (double insurance).
+            modeling_module.torch.cat = _safe_cat
+            torch.cat = _safe_cat
+            torch.Tensor.masked_scatter_ = _safe_masked_scatter_
+            try:
+                return _original_forward(self, *args, **kwargs)
+            finally:
+                # Restore the state to avoid contaminating other modules.
+                modeling_module.torch.cat = _orig_cat
+                torch.cat = _orig_cat
+                torch.Tensor.masked_scatter_ = _orig_masked_scatter_
+
+        UnlimitedOCRModel.forward = _patched_forward
+        UnlimitedOCRModel._swift_multi_gpu_patched = True
+        return True
+
+    def get_model(self, model_dir: str, *args, **kwargs) -> PreTrainedModel:
+        logger = get_logger()
+
+        self.auto_model_cls = self.auto_model_cls or AutoModel
+        model = super(DeepseekOCRLoader, self).get_model(model_dir, *args, **kwargs)
+        patch_output_clone(model.model.embed_tokens)
+        patch_output_to_input_device(model.model.sam_model)
+        patch_output_to_input_device(getattr(model.model, self.visual_name))
+        patch_output_to_input_device(model.model.projector)
+        patch_output_to_input_device(model.model)
+
+        _orig_sw = (getattr(model.config, 'sliding_window_size', None) or getattr(model.config, 'sliding_window', None))
+        if _orig_sw is not None:
+            model.config._ring_window = _orig_sw
+            model.config.sliding_window = None
+            logger.info('[UnlimitedOCR] R-SWA enabled: ring_window=%d', _orig_sw)
+        else:
+            logger.warning('[UnlimitedOCR] sliding_window config not found, R-SWA may not work.')
+
+        n_devices = len(set(str(p.device) for p in model.parameters() if p.device.type == 'cuda'))
+        if n_devices > 1:
+            if self._apply_multi_gpu_patch():
+                logger.info('[UnlimitedOCR] Multi-GPU patch applied (%d GPUs).', n_devices)
+            else:
+                logger.warning('[UnlimitedOCR] Multi-GPU deployment failed to apply patch.'
+                               'If an inference error occurs, please check whether'
+                               ' `modeling_unlimitedocr` has been loaded correctly.')
+
+        return model
+
+
+register_model(
+    ModelMeta(
+        MLLMModelType.unlimited_ocr,
+        [
+            ModelGroup([
+                Model('PaddlePaddle/Unlimited-OCR', 'PaddlePaddle/Unlimited-OCR'),
+            ]),
+        ],
+        UnlimitedOCRLoader,
+        template=TemplateType.unlimited_ocr,
+        model_arch=ModelArch.unlimited_ocr,
+        architectures=['UnlimitedOCRForCausalLM'],
         requires=['transformers==4.46.3', 'easydict'],
         tags=['vision'],
     ))

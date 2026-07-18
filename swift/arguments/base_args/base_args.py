@@ -1,14 +1,17 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import json
 import os
+import peft
+import shutil
 from dataclasses import dataclass, field, fields
 from packaging import version
 from typing import Any, Dict, List, Literal, Optional, Union
 
 import swift
+from swift.dataset import load_dataset
 from swift.hub import get_hub
 from swift.model import get_ckpt_dir, get_model_processor, load_by_unsloth
-from swift.ray import RayArguments
+from swift.ray_utils import RayArguments
 from swift.template import Template, get_template
 from swift.tuner_plugin import tuners_map
 from swift.utils import (Processor, check_json_format, get_dist_setting, get_logger, import_external_file, is_dist,
@@ -25,6 +28,19 @@ logger = get_logger()
 def get_supported_tuners():
     return {'lora', 'full', 'longlora', 'adalora', 'llamapro', 'adapter', 'vera', 'boft', 'fourierft', 'reft', 'bone'
             } | set(tuners_map.keys())
+
+
+def _patch_peft():
+    """Patch peft functions that are incompatible with SWIFT.
+
+    1. _maybe_shard_state_dict_for_tp: TP sharding is not used by SWIFT, and causes errors
+       when torch.distributed is initialized (e.g. MoE training with target_parameters).
+    2. _maybe_shard_state_dict_for_tp internal logic accesses base_layer.weight.device which
+       fails for expert modules that don't have a `weight` attribute.
+    """
+    if version.parse(peft.__version__) >= version.parse('0.19.0'):
+        from peft.utils import save_and_load
+        save_and_load._maybe_shard_state_dict_for_tp = lambda model, state_dict, adapter_name: None
 
 
 @dataclass
@@ -49,6 +65,7 @@ class BaseArguments(GenerationArguments, QuantizeArguments, DataArguments, Templ
         model_kwargs (Optional[str]): Additional keyword arguments for specific models, passed as a JSON string
             (e.g., '{"key": "value"}'). It's recommended to use the same arguments for inference as for training.
             Default is None.
+        enable_npu_model_patch (bool): Whether to enable model-related NPU patches. Default is True.
         load_args (bool): Whether to load `args.json` from a checkpoint when using `--resume_from_checkpoint`,
             `--model`, or `--adapters`. Defaults to True for inference/export and False for training. Usually,
             this does not need to be modified. Default is True.
@@ -57,6 +74,10 @@ class BaseArguments(GenerationArguments, QuantizeArguments, DataArguments, Templ
         packing (bool): Whether to enable packing of datasets. Default is False.
         packing_length (Optional[int]): Length of packing. Default is None.
         packing_num_proc (int): Number of processes used for packing, Default is 1.
+        packing_strategy (Literal['binpack', 'sequential']): Packing algorithm. 'binpack' (default) uses
+            best-fit-decreasing bin packing (reorders samples); 'sequential' uses order-preserving greedy
+            packing (next-fit: a single open pack, flushed when the next sample doesn't fit) so the sample
+            order / pack boundaries follow a sequential sampler (use packing_num_proc=1). Default is 'binpack'.
         lazy_tokenize (Optional[bool]): Whether to enable lazy tokenization. Default is None.
         use_hf (bool): Whether to use Hugging Face for downloading/uploading models and datasets. If False,
             ModelScope is used. Default is False.
@@ -70,7 +91,6 @@ class BaseArguments(GenerationArguments, QuantizeArguments, DataArguments, Templ
     """
     tuner_backend: Literal['peft', 'unsloth'] = 'peft'
     tuner_type: str = field(default='lora', metadata={'help': f'tuner_type choices: {list(get_supported_tuners())}'})
-    train_type: Optional[str] = None  # compat swift3.x
     adapters: List[str] = field(default_factory=list)
     external_plugins: List[str] = field(default_factory=list)
     # This parameter is kept for swift3.x compatibility. Please use `external_plugins` as a replacement.
@@ -78,12 +98,14 @@ class BaseArguments(GenerationArguments, QuantizeArguments, DataArguments, Templ
 
     seed: int = 42
     model_kwargs: Optional[Union[dict, str]] = None
+    enable_npu_model_patch: bool = True
     load_args: bool = True
     load_data_args: bool = False
     # dataset
     packing: bool = False
     packing_length: Optional[int] = None
     packing_num_proc: int = 1
+    packing_strategy: Literal['binpack', 'sequential'] = 'binpack'
     lazy_tokenize: Optional[bool] = None
     # hub
     use_hf: bool = False
@@ -148,9 +170,7 @@ class BaseArguments(GenerationArguments, QuantizeArguments, DataArguments, Templ
         ]
 
     def __post_init__(self):
-        if self.train_type is not None:
-            logger.warning('`train_type` is deprecated, please use `tuner_type` instead.')
-            self.tuner_type = self.train_type
+        _patch_peft()
         self.swift_version = swift.__version__
         if self.use_hf or use_hf_hub():
             self.use_hf = True
@@ -288,6 +308,9 @@ class BaseArguments(GenerationArguments, QuantizeArguments, DataArguments, Templ
             logger.info(f'The {self.__class__.__name__} will be saved in: {fpath}')
             with open(fpath, 'w', encoding='utf-8') as f:
                 json.dump(check_json_format(self.__dict__), f, ensure_ascii=False, indent=2)
+            config_file = os.getenv('SWIFT_CONFIG_FILE')
+            if config_file:
+                shutil.copy(config_file, output_dir)
 
     def _init_device(self):
         if is_dist():
@@ -325,3 +348,20 @@ class BaseArguments(GenerationArguments, QuantizeArguments, DataArguments, Templ
         res['num_labels'] = num_labels or self.num_labels
 
         return get_model_processor(**res)
+
+    def load_dataset(self):
+        dataset_kwargs = self.get_dataset_kwargs()
+        train_dataset, val_dataset = None, None
+        if self.dataset:
+            train_dataset, val_dataset = load_dataset(
+                self.dataset,
+                split_dataset_ratio=self.split_dataset_ratio,
+                shuffle=self.dataset_shuffle,
+                **dataset_kwargs)
+        if len(self.val_dataset) > 0:
+            # Loading val dataset
+            dataset_kwargs.pop('interleave_prob', None)
+            _, val_dataset = load_dataset(
+                self.val_dataset, split_dataset_ratio=1.0, shuffle=self.val_dataset_shuffle, **dataset_kwargs)
+            assert self.split_dataset_ratio == 0.
+        return train_dataset, val_dataset

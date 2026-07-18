@@ -44,7 +44,7 @@ def register_model(model_meta: ModelMeta, *, exist_ok: bool = False) -> None:
 
 def load_by_unsloth(args):
     """Load model by unsloth"""
-    assert is_unsloth_available(), 'please install unsloth if using `use_unsloth=True`: `pip install unsloth`'
+    assert is_unsloth_available(), 'please install unsloth if using `--tuner_backend unsloth`: `pip install unsloth`'
     os.environ['UNSLOTH_RETURN_LOGITS'] = '1'
     os.environ['UNSLOTH_DISABLE_STATISTICS'] = '1'
     model_info = args.model_info
@@ -158,6 +158,7 @@ def get_model_list() -> List[str]:
 
 
 class ModelLoader(BaseModelLoader):
+    default_trust_remote_code = True
 
     def __init__(
         self,
@@ -184,7 +185,10 @@ class ModelLoader(BaseModelLoader):
         self.attn_impl_keys = None
         experts_impl = experts_impl or kwargs.get('experts_implementation')
         if experts_impl is not None and not transformers_5:
-            raise ValueError('experts_impl is only supported in "transformers>=5.0".')
+            if experts_impl == 'eager':
+                experts_impl = None
+            else:
+                raise ValueError('experts_impl is only supported in "transformers>=5.0".')
         self.experts_impl = experts_impl
         self.rope_scaling = rope_scaling
         self.max_model_len = max_model_len
@@ -208,7 +212,6 @@ class ModelLoader(BaseModelLoader):
         else:
             model_kwargs['torch_dtype'] = self.torch_dtype
         _patch_awq_compat(model_info)
-        logger.info(f'model_kwargs: {model_kwargs}')
 
     def _postprocess_config(self, config):
         # fix prediction_step (internvl2, ovis, ...)
@@ -243,7 +246,7 @@ class ModelLoader(BaseModelLoader):
 
     def get_config(self, model_dir: str) -> PretrainedConfig:
         auto_config_cls = self.auto_config_cls or AutoConfig
-        return auto_config_cls.from_pretrained(model_dir, trust_remote_code=True)
+        return auto_config_cls.from_pretrained(model_dir, trust_remote_code=self.default_trust_remote_code)
 
     def _get_tokenizer(self, processor):
         if not isinstance(processor, PreTrainedTokenizerBase) and hasattr(processor, 'tokenizer'):
@@ -256,26 +259,32 @@ class ModelLoader(BaseModelLoader):
     def get_processor(self, model_dir: str, config: PretrainedConfig) -> Processor:
         auto_tokenizer_cls = self.auto_tokenizer_cls
         if auto_tokenizer_cls is None:
-            if os.path.exists(os.path.join(model_dir, 'preprocessor_config.json')):
+            if os.path.exists(os.path.join(model_dir, 'preprocessor_config.json')) or os.path.exists(
+                    os.path.join(model_dir, 'processor_config.json')):
                 from transformers import AutoProcessor
                 auto_tokenizer_cls = AutoProcessor
             else:
                 auto_tokenizer_cls = AutoTokenizer
-        return auto_tokenizer_cls.from_pretrained(model_dir, trust_remote_code=True)
+        return auto_tokenizer_cls.from_pretrained(model_dir, trust_remote_code=self.default_trust_remote_code)
 
     def get_model(self, model_dir: str, config: PretrainedConfig, processor: Processor,
                   model_kwargs) -> PreTrainedModel:
         if self.experts_impl is not None:
             model_kwargs['experts_implementation'] = self.experts_impl
+        logger.info(f'model_kwargs: {model_kwargs}')
         model_info = self.model_info
         model_meta = self.model_meta
         auto_model_cls = self.auto_model_cls
         model = None
-        if model_info.task_type in {'seq_cls', 'reranker'} and auto_model_cls is None and not self.return_dummy_model:
+        if model_info.task_type in {'seq_cls', 'reranker'}:
+            HfConfigFactory.set_config_attr(config, 'tie_word_embeddings', False)
+        if model_info.task_type in {'seq_cls', 'reranker'} and auto_model_cls in {
+                None, AutoModelForSequenceClassification
+        } and not self.return_dummy_model:
             with patch_automodel_for_sequence_classification(model_config=config, patch_from_pretrained=False):
                 try:
                     model = AutoModelForSequenceClassification.from_pretrained(
-                        model_dir, config=config, trust_remote_code=True, **self.model_kwargs)
+                        model_dir, config=config, trust_remote_code=self.default_trust_remote_code, **self.model_kwargs)
                     auto_model_cls = AutoModelForSequenceClassification
                 except ValueError:
                     pass
@@ -304,7 +313,8 @@ class ModelLoader(BaseModelLoader):
             else:
                 context = partial(patch_automodel, **context_kwargs)
             with context():
-                model = auto_model_cls.from_pretrained(model_dir, config=config, trust_remote_code=True, **model_kwargs)
+                model = auto_model_cls.from_pretrained(
+                    model_dir, config=config, trust_remote_code=self.default_trust_remote_code, **model_kwargs)
         # fix not save modeling_xxx.py (transformers 4.45)
         # https://github.com/huggingface/transformers/issues/24737
         has_remote_code = hasattr(config, 'auto_map') and auto_model_cls.__name__ in config.auto_map
@@ -342,7 +352,7 @@ class ModelLoader(BaseModelLoader):
         model.model_meta = self.model_meta
         model.model_dir = model_dir
         self._init_generation_config(model, model_dir)
-        HfConfigFactory.set_model_config_attr(model, 'pad_token_id', self.pad_token)
+        HfConfigFactory.set_config_attr(model.config, 'pad_token_id', self.pad_token)
 
     def _add_new_special_tokens(self, model, processor, config):
         if not self.new_special_tokens:
@@ -404,6 +414,9 @@ class ModelLoader(BaseModelLoader):
             elif hf_model_type == 'qwen3_moe':
                 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseMoeBlock
                 z3_leaf_modules = [Qwen3MoeSparseMoeBlock]
+            elif hf_model_type == 'gemma4':
+                from transformers.models.gemma4.modeling_gemma4 import Gemma4TextExperts
+                z3_leaf_modules = [Gemma4TextExperts]
             elif hf_model_type == 'glm4_moe':
                 from transformers.models.glm4_moe.modeling_glm4_moe import Glm4MoeMoE
                 z3_leaf_modules = [Glm4MoeMoE]
@@ -440,10 +453,11 @@ class ModelLoader(BaseModelLoader):
     def _init_generation_config(self, model, model_dir):
         # generation_config
         generation_config_path = os.path.join(model_dir, 'generation_config.json')
-        if not hasattr(model, 'generation_config') and os.path.isfile(generation_config_path):
-            model.generation_config = GenerationConfig.from_pretrained(model_dir)
+        if getattr(model, 'generation_config', None) is None:
+            model.generation_config = GenerationConfig.from_pretrained(model_dir) if os.path.isfile(
+                generation_config_path) else None
         # fix llama2 warning
-        if getattr(model, 'generation_config', None):
+        if getattr(model, 'generation_config', None) and hasattr(model.generation_config, 'do_sample'):
             fix_do_sample_warning(model.generation_config)
 
     def _get_model_processor(self, model_dir, config):
@@ -458,6 +472,7 @@ class ModelLoader(BaseModelLoader):
         model_dir = self.model_info.model_dir
         with patch_get_dynamic_module(), patch_tp_plan(self.load_model), patch_offload_context:
             config = self.get_config(model_dir)
+            config.name_or_path = model_dir
             self._postprocess_config(config)
             model, processor = self._get_model_processor(model_dir, config)
             self._postprocess_processor(processor)
@@ -472,7 +487,9 @@ class SentenceTransformersLoader(ModelLoader):
     def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:
         from sentence_transformers import SentenceTransformer
         model = SentenceTransformer(
-            model_dir, trust_remote_code=True, model_kwargs={
+            model_dir,
+            trust_remote_code=self.default_trust_remote_code,
+            model_kwargs={
                 'torch_dtype': self.torch_dtype,
             })
         model.config = config

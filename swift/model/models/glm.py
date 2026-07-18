@@ -502,6 +502,16 @@ register_model(
             ModelGroup([
                 Model('ZhipuAI/GLM-5', 'zai-org/GLM-5'),
             ], template=TemplateType.glm4_7),
+            ModelGroup([
+                Model('ZhipuAI/GLM-5.1', 'zai-org/GLM-5.1'),
+                Model('ZhipuAI/GLM-5.1-FP8', 'ZhipuAI/GLM-5.1-FP8'),
+            ],
+                       template=TemplateType.glm5_1),
+            ModelGroup([
+                Model('ZhipuAI/GLM-5.2', 'ZhipuAI/GLM-5.2'),
+                Model('ZhipuAI/GLM-5.2-FP8', 'ZhipuAI/GLM-5.2-FP8'),
+            ],
+                       template=TemplateType.glm5_2),
         ],
         architectures=['GlmMoeDsaForCausalLM'],
         requires=['transformers>=5.2.0'],

@@ -48,15 +48,16 @@ class SwiftInfer(SwiftPipeline):
             raise
 
     @staticmethod
-    def get_infer_engine(args: InferArguments, template=None, **kwargs):
-        kwargs.update({
+    def get_infer_engine(args: InferArguments, template=None, **extra_kwargs):
+        infer_backend = extra_kwargs.pop('infer_backend', None) or args.infer_backend
+        engine_kwargs = extra_kwargs.pop('engine_kwargs', {})
+        kwargs = {
             'model_id_or_path': args.model,
             'model_type': args.model_type,
             'revision': args.model_revision,
             'torch_dtype': args.torch_dtype,
             'template': template,
-        })
-        infer_backend = kwargs.pop('infer_backend', None) or args.infer_backend
+        }
         if infer_backend in {'transformers', 'vllm'}:
             kwargs['reranker_use_activation'] = args.reranker_use_activation
         if infer_backend == 'transformers':
@@ -85,6 +86,10 @@ class SwiftInfer(SwiftPipeline):
         else:
             raise ValueError(f'Inference backend `{infer_backend}` is not supported. '
                              'Please use one of: transformers, vllm, sglang, lmdeploy.')
+        if engine_kwargs:
+            kwargs['engine_kwargs'] = kwargs.get('engine_kwargs') or {}
+            kwargs['engine_kwargs'].update(engine_kwargs)
+        kwargs.update(extra_kwargs)
         return infer_engine_cls(**kwargs)
 
     def run(self) -> List[Dict[str, Any]]:

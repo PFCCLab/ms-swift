@@ -3,7 +3,7 @@
 ## Megatron参数
 
 **训练参数**:
-- 🔥micro_batch_size: 每个device的批次大小，默认为1。
+- 🔥micro_batch_size: 每个DP组的批次大小，默认为1。
 - 🔥global_batch_size: 总批次大小，等价于`micro_batch_size*数据并行大小*梯度累加步数`。默认为16。
   - 其中，`数据并行大小 (DP) = 总GPU数 / (TP × PP × CP)`。
 - 🔥recompute_granularity: 重新计算激活的粒度，可选项为'full', 'selective' and 'none'。其中full代表重新计算整个transformer layer，selective代表只计算transformer layer中的核心注意力部分。通常'selective'是推荐的。默认为'selective'。
@@ -27,15 +27,18 @@
 - gradient_accumulation_fusion: 默认为True。用于开启梯度累加融合。
 - 🔥cross_entropy_loss_fusion: 启动交叉熵损失计算融合。默认为True。
 - cross_entropy_fusion_impl: 交叉熵损失融合的实现。可选为'native'和'te'。默认为'native'。
+  - **"ms-swift>=4.3.1"默认值从"te"修改为"native"**，原因查看[这个PR](https://github.com/NVIDIA/Megatron-LM/pull/5115)，这可能会导致更多的显存占用。
 - calculate_per_token_loss: 根据全局批次中的非填充token数量来对交叉熵损失进行缩放。默认为None，`task_type`为'causal_lm'且为预训练/微调时，默认为True，否则默认为False。
-- 🔥attention_backend: 使用的注意力后端 (flash、fused、unfused、local、auto)。默认为 flash。
-  - 如果安装'flash_attention_3'，`--attention_backend flash`则优先使用fa3。训练脚本参考[这里](https://github.com/modelscope/ms-swift/tree/main/examples/train/flash_attention_3)。多模态模型的vit部分要使用flash_attention_3，请设置`--attn_impl flash_attention_3`。
+- 🔥attention_backend: 使用的注意力后端 (flash、fused、unfused、local、auto、flash_2、flash_3、flash_4)。默认为 flash。
+  - 如果安装'flash_attention_4/3'，`--attention_backend flash`则优先使用fa4/fa3。如果要显式设置，你可以设置`--attention_backend flash_2/3/4`。训练脚本参考[这里](https://github.com/modelscope/ms-swift/tree/main/examples/train/flash_attention_3)。多模态模型的vit部分要使用flash_attention_4/3，请设置`--attn_impl flash_attention_4/3`。
   - 有些模型可能不支持flash，你需要手动设置`--attention_backend unfused/fused --padding_free false`，例如：Llama4、GPT-OSS。
-- optimizer: 优化器类型，可选为'adam'、'sgd'。默认为adam。
+- optimizer: 优化器类型，可选为'adam'、'sgd'、'muon'和'dist_muon'。默认为adam。
   - 注意：此'adam'为'adamw'，参考[这里](https://github.com/NVIDIA/TransformerEngine/blob/d8f1e68f7c414f3e7985a8b41de4443b2f819af3/transformer_engine/pytorch/optimizers/fused_adam.py#L69-L70)。
+  - 其中'muon'和'dist_muon'需要"megatron-core>=0.16"。
 - 🔥optimizer_cpu_offload: 将优化器状态卸载到 CPU，例如设置：`--use_precision_aware_optimizer true --optimizer_cpu_offload true --optimizer_offload_fraction 0.7`。默认为False。
   - 该参数可以显著降低显存占用（但增加内存占用）。若global_batch_size较大，则对训练速度的影响不大。
 - 🔥optimizer_offload_fraction: 卸载到 CPU 的优化器状态所占比例。默认为1.。
+- optimizer_cuda_graph: 是否为优化器步骤启用 CUDA 计算图，传递给 Megatron 的 `--optimizer-cuda-graph`。默认为False。该参数需要"megatron-core>=0.17"。
 - use_precision_aware_optimizer: 使用 TransformerEngine 中的精度感知优化器，该优化器允许将主参数和优化器状态设置为较低精度，例如 fp16 和 fp8。
 - main_grads_dtype: 启用 use_precision_aware_optimizer 时主梯度的 dtype。可选为'fp32', 'bf16'。默认为'fp32'。
 - main_params_dtype: 启用 use_precision_aware_optimizer 时主参数的 dtype。可选为'fp32', 'fp16'。默认为'fp32'。
@@ -53,7 +56,8 @@
 - 🔥dataloader_num_workers: dataloader的workers数量，默认为4。
   - 注意：若设置`--streaming true`，则设置为1。
 - dataloader_pin_memory: 默认为True。
-- dataloader_persistent_workers: 默认为True。
+- dataloader_persistent_workers: 默认为False。
+  - 注意：该参数在"ms-swift<4.3"默认为True，为避免内存泄漏问题修改为False。
 - dataloader_prefetch_factor: 默认为2。
 - data_sharding: 当`--train_dataloader_shuffle true`时对 train_dataloader 生效，默认为False。该参数控制数据集随机的范围。若设置为True，则先对数据集进行分片，然后对每个分片进行随机处理（略节约内存）；若设置为False，则先对数据集进行随机，再进行分片（更好的随机效果）。
 - 🔥group_by_length: 是否在训练数据集中将长度大致相同的样本分组在一起（有随机因素），以最小化填充并确保各节点与进程的负载均衡以提高效率。默认为False。具体算法参考`transformers.trainer_pt_utils.get_length_grouped_indices`。
@@ -62,7 +66,7 @@
 - padding_free: 将一个batch中的数据进行展平而避免数据padding，从而降低显存占用并加快训练。默认为True。
   - 若要自定义attention_mask，你可以设置`--padding_free false`。
   - 注意：**Megatron-SWIFT训练特性优先支持padding_free格式**，若非特殊情况，请勿修改该值。
-- mlp_padding_free: 默认为False。用于padding_free设置为false时，对mlp进行padding_free优化。这可以在自定义attention_mask的同时，提升训练速度和减少显存占用。
+- mlp_padding_free: 默认为False。用于padding_free设置为false时，对mlp进行padding_free优化。这可以在自定义attention_mask的同时，提升训练速度和减少显存占用。（暂时与CP不兼容）
 
 
 **学习率参数**:
@@ -73,6 +77,7 @@
 - lr_warmup_iters: 线性学习率预热的迭代次数，默认为0。
 - 🔥lr_warmup_fraction: 线性学习率预热阶段所占比例，默认为None。
 - 🔥min_lr: 学习率的最小值，将低于该阈值的学习率裁剪为该值，默认为0。
+  - 注意：`vit_lr`的`min_lr`为`vit_lr * min_lr / lr`，`aligner_lr`的`min_lr同理。
 - lr_wsd_decay_style: WSD 退火阶段的衰减方式。默认为'exponential'。
 - lr_wsd_decay_iters: 学习率衰减的迭代次数。默认为 None。
 
@@ -88,6 +93,20 @@
 - adam_eps: 默认1e-8。
 - sgd_momentum: 设置`--optimizer sgd`时生效，默认为0.9。
 
+
+**muon参数**:
+- muon_momentum: Muon 优化器的动量因子。默认为0.9。
+- muon_split_qkv: 是否为 Muon 优化器拆分 QKV 参数，默认为True。
+- muon_use_nesterov: 是否在内部 SGD 中使用 Nesterov 风格的动量，默认为False。
+- muon_scale_mode: Muon 优化器的缩放模式。可选为'spectral', 'unit_rms_norm', 'shape_scaling'。默认为'spectral'。
+- muon_fp32_matmul_prec: Newton-Schulz 迭代的 FP32 矩阵乘法精度，可选为'low', 'medium', 'high'。默认为'medium'。
+- muon_coefficient_type: Muon 优化器 Newton-Schulz 迭代的系数类型，传递给 Megatron 的 `--muon-coefficient-type`。可选值取决于所安装的 emerging_optimizers 版本（如'quintic', 'polar_express', 'simple', 'cans', 'aol', 'deepseekv4', 'cubic5', 'custom'）。默认为'quintic'。
+- muon_num_ns_steps: Muon 优化器的 Newton-Schulz 步数。默认为5。
+- muon_tp_mode: 张量模型并行权重的 NS 计算方式。可选为'blockwise', 'duplicated', 'distributed'。默认为'blockwise'。
+- muon_extra_scale_factor: Muon 更新的额外缩放因子，默认为1。
+- muon_scalar_optimizer: 使用 Muon 时非线性参数（embeddings、biases、norms）的优化器，可选为'adam'或'lion'。默认为'adam'。
+
+
 **checkpoint参数**:
 - 🔥output_dir: checkpoint的输出目录，默认None。在训练中，若未设置该参数，则默认为`f'megatron_output/{model_suffix}'`，例如`'megatron_output/Qwen2.5-7B-Instruct'`。
   - 注意：**若在多机训练时，请确保每个节点的保存路径指向相同位置**，否则你需要在训练后手动集中这些权重。
@@ -97,7 +116,8 @@
 - 🔥no_save_rng: 不保存rng，默认为False。
 - 🔥mcore_model: 加载的checkpoint目录（mcore存储格式），默认None。对于断点续训的介绍，请查看`--finetune false`参数的介绍。
   - megatron-swift推荐直接加载和存储safetensors权重，参考[mcore-bridge文档](./Mcore-Bridge.md)。
-  - `--model`与`--mcore_model`的区别：`--model/--adapters/--ref_model/--ref_adapters`后加safetensors权重目录，`--mcore_model/--mcore_adapter/--mcore_ref_model/--mcore_ref_adapter`后加mcore权重目录。`--model/--adapters`不支持加载断点续训状态，因此若设置`--no_save_optim false`，将额外存储mcore权重格式用于断点续训，你需要使用`--mcore_model/--mcore_adapter`来加载断点续训的状态。
+  - `--model`与`--mcore_model`的区别：`--model/--adapters/--ref_model/--ref_adapters`后加safetensors权重目录，`--mcore_model/--mcore_adapter/--mcore_ref_model/--mcore_ref_adapter`后加mcore权重目录。
+  - `--model/--adapters`不支持加载断点续训状态，因此若设置`--no_save_optim false`，将额外存储mcore权重格式用于断点续训，你需要使用`--mcore_model/--mcore_adapter`来加载断点续训的状态。例如：`--model <hf-model> --mcore_adapter <mcore-adapter-ckpt>`。（使用`--model/--adapters`断点续训也可以，只是不读取优化器状态。）
 - 🔥no_load_optim: 不载入optimizer，默认为False。
   - 注意：断点续训时，设置`--no_load_optim false`读取优化器状态通常比`--no_load_optim true`不读取优化器状态消耗更大的显存资源。
 - 🔥no_load_rng: 不载入rng，默认为False。
@@ -127,9 +147,9 @@
 - 🔥decoder_first_pipeline_num_layers: decoder第一个流水线阶段所包含的Transformer层数。默认为 None，表示将Transformer层数平均分配到所有流水线阶段。
   - 该参数通常用于**Transformer层数无法被PP整除**，或者多模态模型第0个pp阶段显存占用过高的情况。
 - 🔥decoder_last_pipeline_num_layers: decoder最后一个流水线阶段所包含的Transformer层数。默认为 None，表示将Transformer层数平均分配到所有流水线阶段。
-- account_for_embedding_in_pipeline_split: 如果设置为 True，在流水线并行的划分和放置策略中，输入 embedding 层会被视为一个标准的 Transformer 层来处理。默认为False。
-- account_for_loss_in_pipeline_split: 如果设置为 True，在流水线并行的划分和放置策略中，loss 层会被视为一个标准的 Transformer 层来处理。默认为False。
 - overlap_p2p_comm: 在 1F1B 中将流水线并行通信与前向和反向块重叠，默认为True。
+- batch_p2p_comm: 使用 batch_isend_irecv 代替单独的 isend/irecv 调用。默认为None，设置为`not args.overlap_p2p_comm`。
+  - 如果出现PP并行卡住的情况，可以设置为False。
 - align_param_gather: 设置为True，所有 PP 阶段将同时启动参数全收集（all-gather）操作。否则，每个 PP 阶段将根据需要独立启动。默认为True。
 - 🔥sequence_parallel: 启动序列并行优化，该参数需要设置`tensor_model_parallel_size`才生效。默认为False。
 - 🔥context_parallel_size: cp数，默认为1。
@@ -138,7 +158,7 @@
 - 🔥overlap_param_gather: 启用分布式优化器中参数all-gather的重叠（降低DP通信耗时）。默认为False。
 - virtual_pipeline_model_parallel_size: 每个流水线并行 rank 的虚拟流水线阶段数量。默认为None。vpp并行，用于减少pp并行的计算空泡，提高GPU利用率，但会略微提高通信量。
 - microbatch_group_size_per_vp_stage: 每个虚拟流水线阶段处理的连续微批次数量。默认为None，等于pipeline_model_parallel_size。
-- 🔥pipeline_model_parallel_layout: 一个描述自定义流水线（pp/vpp）模型并行布局的字符串。例如："E|(t|)*3,m|m||L"。其中 E、L、t、m 分别表示嵌入层（embedding）、损失层（loss）、Transformer 解码器层和 MTP 层。阶段之间用 "|" 分隔。重复的阶段或层可以通过乘法表示。逗号仅用于提升可读性（无实际语法作用）。默认值为 None，表示不使用此参数设置布局。
+- 🔥pipeline_model_parallel_layout: 一个描述自定义流水线（pp/vpp）模型并行布局的字符串。例如：`"Et*4|(tttt|)*14tmL"`。其中 E、L、t、m 分别表示嵌入层（embedding）、损失层（loss）、Transformer 解码器层和 MTP 层。阶段之间用 "|" 分隔。重复的阶段或层可以通过乘法表示。逗号仅用于提升可读性（无实际语法作用）。默认值为 None，表示不使用此参数设置布局。
   - 该参数通常在异构GPU集群上使用。
 - 🔥expert_model_parallel_size: 专家并行数，默认为1。
 - 🔥expert_tensor_parallel_size: 专家TP并行度。默认值为1。
@@ -147,7 +167,7 @@
 **日志参数**:
 - report_to: 启用的日志后端。默认为`['tensorboard']`。可选项为'tensorboard', 'wandb'和'swanlab'。'wandb'和'swanlab'登陆可以使用`WANDB_API_KEY`、`SWANLAB_API_KEY`环境变量。
 - 🔥logging_steps: 日志记录的间隔（steps），默认为5。
-- tensorboard_dir: tensorboard日志写入的目录。默认None，即存储在`f'{save}/runs'`目录下。
+- tensorboard_dir: tensorboard日志写入的目录。默认None，即存储在`f'{output_dir}/runs'`目录下。
 - tensorboard_queue_size: 用于暂存事件和摘要的 TensorBoard 队列大小；当队列中待处理的事件和摘要数量达到该大小时，下一次调用 "add" 相关方法会触发将数据刷新写入磁盘。默认为50。
 - wandb_project: wandb项目名称，默认为'megatron-swift'。
 - wandb_exp_name: wandb 实验名称。默认为`--output_dir`的值。
@@ -161,10 +181,16 @@
 **fp8参数**:
 - fp8_format: 用于前向和反向传播中FP8张量的FP8格式方案。可选为'e4m3'，'hybrid'。默认为None。
 - fp8_recipe: 用于前向和反向传播中 FP8 张量的 FP8 算法方案。可选为'tensorwise', 'delayed', 'mxfp8', 'blockwise'。默认为'delayed'。其中blockwise fp8需要 cuda129 以上版本。
-- fp8_amax_history_len: 每个张量记录 amax 历史的步数。默认为1024。
-- fp8_amax_compute_algo: 用于根据历史记录计算 amax 的算法。可选为'most_recent', 'max'。默认为'max'。
 - fp8_param_gather: 保持计算参数为 fp8（不使用任何其他中间数据类型），并在 fp8 格式下执行参数的 all-gather 操作。默认为False。
   - 提示：若想导出FP8权重格式，设置为True；否则设置为False。
+- fp8_amax_history_len: 每个张量记录 amax 历史的步数。默认为1024。
+- fp8_amax_compute_algo: 用于根据历史记录计算 amax 的算法。可选为'most_recent', 'max'。默认为'max'。
+
+**fp4参数**:
+- fp4_format: 用于前向和反向传播中FP4张量的FP4格式方案，可选为'e2m1'。默认为None。
+- fp4_recipe: 若设置此参数，则通过 Transformer Engine 启用 FP4 精度。目前仅支持 'nvfp4'，该选项使用适用于 Blackwell+ 架构的 NVFP4BlockScaling 方案。默认为'nvfp4'。
+- fp4_param_gather: 若设置此参数，则将参数保持为 FP4 精度以节省内存。注意并非所有参数都会被转换为 FP4，例如偏置项将保持不变。默认为False。
+
 
 **混合精度参数**:
 - fp16: fp16模式。默认为None，会根据模型的torch_dtype进行设置，即torch_dtype为float16或者float32则fp16设置为True。torch_dtype默认读取config.json。
@@ -174,26 +200,40 @@
 - accumulate_allreduce_grads_in_fp32: 在 fp32 精度下进行梯度累积和全规约操作。如果开启`--bf16`且`main_params_dtype`为'fp32'，则设置为True。否则默认设置为False。
 
 **MoE参数**:
-- moe_router_load_balancing_type: 确定路由器的负载均衡策略。可选项为"aux_loss"、"seq_aux_loss"、"global_aux_loss"、"sinkhorn"、"none"。其中, "global_aux_loss"需要"megatron-core>=0.15"。默认值为 None。从config.json中读取。
+- moe_router_load_balancing_type: 确定路由器的负载均衡策略。可选项为"aux_loss"、"seq_aux_loss"、"global_aux_loss"、"sinkhorn"、"none"。支持单/多种策略的列表（如 `--moe_router_load_balancing_type seq_aux_loss global_aux_loss`）。默认值为 None。从config.json中读取。
 - 🔥moe_router_dtype: 用于路由计算和专家输出加权平均的数据类型。可选为'none', 'fp32'、'fp64'，这增强了数值稳定性，尤其是在专家数量较多时。与`moe_permute_fusion`一起使用时，性能影响可以忽略不计。默认为'fp32'。'none'代表不改变数据类型。
 - moe_token_dispatcher_type: 要使用的token分发器类型。可选选项包括 'allgather'、'alltoall'、'flex'和'alltoall_seq'。默认值为'alltoall'。
 - moe_enable_deepep: 启用 DeepEP 以实现 MoE 模型中的高效 token 调度和合并。仅在通过设置 `--moe_token_dispatcher_type flex` 使用弹性 token 调度器时有效。
 - 🔥moe_grouped_gemm: 当每个rank包含多个专家时，通过在多个流中启动多个本地 GEMM 内核，利用 TransformerEngine中的GroupedLinear提高利用率和性能。默认为True。
 - 🔥moe_permute_fusion: 在令牌分发过程中融合令牌重排操作。默认为False。
-- 🔥moe_aux_loss_coeff: 默认为0，不使用aux_loss。**通常情况下，该值设置的越大，训练效果越差，但MoE负载越均衡**，请根据实验效果，选择合适的值。
+- 🔥moe_aux_loss_coeff: 默认为0，不使用aux_loss。支持单/多个浮点数的列表 ，对应`moe_router_load_balancing_type` 中各策略。通常情况下，该值设置的越大，训练效果越差，但MoE负载越均衡，请根据实验效果，选择合适的值。
 - moe_z_loss_coeff: z-loss 的缩放系数。默认为None。
 - 🔥moe_shared_expert_overlap: 启用共享专家计算与调度器通信之间的重叠。如果不启用此选项，共享专家将在路由专家之后执行。仅在设置了`moe_shared_expert_intermediate_size`时有效。默认为False。
 - 🔥moe_expert_capacity_factor: 每个专家的容量因子，None表示不会丢弃任何token。默认为None。通过设置 `--moe_expert_capacity_factor`，超出专家容量的 token 会基于其被选中的概率被丢弃。可以**令训练负载均匀，提升训练速度**（例如设置为1或2）。
 - moe_pad_expert_input_to_capacity: 对每个专家（expert）的输入进行填充，使其长度与专家容量（expert capacity length）对齐，默认为False。该操作仅在设置了 `--moe_expert_capacity_factor` 参数后才生效。
 - moe_token_drop_policy: 可选为'probs', 'position'。默认为'probs'。
 
+**DSA参数**
+- dsa_indexer_loss_coeff: DSA 索引器 KL 散度损失的系数。设置为 0 可禁用索引器损失。默认为`0.`。
+- dsa_indexer_use_sparse_loss: 是否使用稀疏 DSA 索引器损失。如果为 True，索引器损失将使用 top-k 索引进行计算。默认为False。
+- apply_dsa_kernel_fusion: 是否启用融合 DSA 稀疏注意力内核（FlashMLA + cuDNN DSA）。设为 False 将回退到未融合的 PyTorch 实现。需要安装 flash_mla 和 nvidia-cudnn-frontend >= 1.24.0。默认为False。（需使用Megatron-LM dev分支）
+
+**Deepseek-V4**
+- csa_dense_mode: 是否对压缩稀疏注意力使用密集模式。若为 `True`，CSA 索引器将被禁用。默认为False。
+- use_fused_mhc: 对 mHC 操作使用 cuTile 融合内核。若为 True，将尝试用融合的 cuda.tile（cuTile）自动微分函数替换参考
+mHC 模块以在支持的 GPU 上获得更好的性能。需要安装 cuTile；若 cuTile 不可用，该标志将被静默重置为 False 并发出警告。默认为False。
+- mhc_recompute_layer_num: 每个 MHC 重计算块的层数。设置后，每 `mhc_recompute_layer_num` 层构成一个重计算块。若为 None，Transformer 块中的所有层共享单个重计算块。默认为None。
+
 **MTP参数**
-- mtp_num_layers: 多token预测（MTP）层的数量。MTP将每个位置的预测范围扩展到多个未来token。此MTP实现使用D个顺序模块依次预测D个额外的token。默认为None。（需要"megatron-core>=0.14"）
-  - 注意：mtp_num_layers的值，将不自动从config.json获取，需手动设置。你可以参考config.json中的`num_nextn_predict_layers`字段填写该值。使用mcore-bridge时，将优先从safetensors文件中加载MTP权重，若无法找到，则进行随机初始化。（若要使用blockwise fp8 + mtp，请使用mcore>=0.15）
+- mtp_num_layers: 多token预测（MTP）层的数量。MTP将每个位置的预测范围扩展到多个未来token。此MTP实现使用D个顺序模块依次预测D个额外的token。默认为None。
+  - 注意：mtp_num_layers的值，将不自动从config.json获取，需手动设置。你可以参考config.json中的`num_nextn_predict_layers`, `mtp_num_hidden_layers`字段填写该值。使用mcore-bridge时，将优先从safetensors文件中加载MTP权重，若无法找到，则进行随机初始化。
 - mtp_loss_scaling_factor: 多token预测（MTP）损失的缩放因子。我们计算所有深度上MTP损失的平均值，然后乘以该缩放因子得到总体MTP损失，它将作为一个额外的训练目标。默认为0.1。
+- mtp_decoder_input_detach: 用来控制 MTP 分支里的 decoder_input 是否停止梯度。默认为False。开启后，MTP loss 不会直接通过 decoder_input 回传到 embedding/vit，但仍会通过 hidden_states 路径更新主干。
+- mtp_shared_weights: MTP层之间共享权重，采用GLM-5使用的mtp方案。默认为False。例如你可以设置`--mtp_num_layers 3 --mtp_shared_weights true`。
 
 **Tuner参数**:
-- tuner_type: 可选为'lora'和'full'。默认为'full'。（**在ms-swift3.x中参数名为`train_type`**）
+- tuner_type: 可选为'lora', 'full'和'lora_llm'。默认为'full'。
+  - 其中'lora_llm'代表对llm部分进行lora，vit/aligner部分使用'full'。你可以使用`vit_lr/aligner_lr`设置各自的学习率。
 - 🔥freeze_llm: 该参数只对多模态模型生效，可用于全参数训练和LoRA训练，但会产生不同的效果。若是全参数训练，将freeze_llm设置为True会将LLM部分权重进行冻结；若是LoRA训练且`target_modules`设置为'all-linear'，将freeze_llm设置为True将会取消在LLM部分添加LoRA模块。该参数默认为False。
 - 🔥freeze_vit: 该参数只对多模态模型生效，可用于全参数训练和LoRA训练，但会产生不同的效果。若是全参数训练，将freeze_vit设置为True会将vit部分权重进行冻结；若是LoRA训练且`target_modules`设置为'all-linear'，将freeze_vit设置为True将会取消在vit部分添加LoRA模块。该参数默认为True。
   - 注意：**这里的vit不仅限于vision_tower, 也包括audio_tower**。若是Omni模型，若你只希望对vision_tower加LoRA，而不希望对audio_tower加LoRA，你可以修改[这里的代码](https://github.com/modelscope/ms-swift/blob/a5d4c0a2ce0658cef8332d6c0fa619a52afa26ff/swift/llm/model/model_arch.py#L544-L554)。
@@ -227,30 +267,37 @@ lora训练：
 - adapters: safetensors格式的LoRA增量权重的adapter_id或者adapter_path。默认为`[]`。
 - ref_model: ref_model safetensors权重的model_id或者model_path。采用grpo、dpo、kto算法且使用全参数训练时需要传入。默认为None，设置为`--model`。
 - ref_adapters: ref_adapters safetensors权重的adapter_id或者adapter_path的列表（目前只支持长度为1），默认为`[]`。
-- use_hf: 控制模型下载、数据集下载、模型推送使用ModelScope还是HuggingFace。默认为False，使用ModelScope。
+- use_hf: 控制模型下载、数据集下载、模型推送使用[ModelScope](https://modelscope.cn/)还是[HuggingFace](https://huggingface.co/)。默认为False，使用ModelScope。
+  - 提示：如果你想在国外访问ModelScope，可以尝试使用[ModelScope国际版](https://modelscope.ai/home)，设置环境变量`MODELSCOPE_DOMAIN='www.modelscope.ai'`即可。
 - hub_token: hub token. modelscope的hub token可以查看[这里](https://modelscope.cn/my/myaccesstoken)。默认为None。
 - merge_lora: 是否存储合并后的权重。默认为None，若`save_safetensors`设置为True，该参数默认值为`True`，否则为False。即默认情况下，存储为safetensors格式时会合并LoRA；存储为torch_dist格式时，不会合并LoRA。
 - max_shard_size: safetensors格式存储文件最大大小，默认'5GB'。
 - 🔥offload_bridge: Megatron导出的用于vLLM更新HF格式权重使用CPU主存存放，以降低 GPU 显存占用。默认为 False。（在GRPO/GKD算法中生效）
 
 **多模态参数**:
-- vit_gradient_checkpointing: 多模态模型训练时，是否对vit部分开启gradient_checkpointing。默认为True。（**Megatron-SWIFT的vit实现使用transformers实现**）
-- attn_impl: 多模态模型训练时，设置vit部分的attn_impl实现。默认为'flash_attn'。
+- vit_gradient_checkpointing: 多模态模型训练时，是否对vit部分开启gradient_checkpointing。默认为None，即当`--freeze_vit`为`false`时开启。（**Megatron-SWIFT的vit实现使用transformers实现**）
+- vit_gradient_checkpointing_kwargs: 传入`torch.utils.checkpoint`中的参数。例如设置为`--vit_gradient_checkpointing_kwargs '{"use_reentrant": false}'`。默认为None。该参数只对`vit_gradient_checkpointing`生效。
+- vit_attn_impl: 多模态模型训练时，设置vit部分的attn_impl实现。默认为'flash_attn'。
 - vit_lr: 当训练多模态大模型时，该参数指定vit的学习率，默认为None，等于learning_rate。通常与`--freeze_vit`、`--freeze_aligner`参数结合使用。
   - 提示：在日志中打印的"learning rate"为llm的学习率。
 - aligner_lr: 当训练多模态大模型时，该参数指定aligner的学习率，默认为None，等于learning_rate。
-- gradient_checkpointing_kwargs: 传入`torch.utils.checkpoint`中的参数。例如设置为`--gradient_checkpointing_kwargs '{"use_reentrant": false}'`。默认为None。该参数只对`vit_gradient_checkpointing`生效。
+
 
 **其他参数**:
+- megatron_extra_kwargs: 透传入Megatron的其他参数（透传入[mcore-bridge](https://github.com/modelscope/mcore-bridge/blob/78cb9be33ebad69a0d940a2bc4e198f866084b70/src/mcore_bridge/config/model_config.py#L116)的 `ModelConfig` 类，继承自 megatron-core 的 TransformerConfig），也可用于覆盖自动读取的`config.json`参数。传入json字符串。默认为None。
+- language_model_only: 只训练多模态模型的语言模型部分，并且只会加载和保存语言模型部分。默认为False。（需"mcore-bridge>=1.4.3"）
 - check_model: 检查本地模型文件有损坏或修改并给出提示，默认为True。**如果是断网环境，请设置为False**。
 - rope_scaling: rope_scaling相关参数，默认为None。格式参考[llama3.1 config.json](https://modelscope.cn/models/LLM-Research/Meta-Llama-3.1-8B-Instruct/file/view/master?fileName=config.json&status=1)，传入json字符串。
   - **目前rope_scaling模块使用transformers实现，支持transformers支持的所有rope_scaling。**
 - apply_wd_to_qk_layernorm: 用于Qwen3-Next/Qwen3.5全参数训练，对 qk layernorm 应用权重衰减。默认为False。
+- linear_decoupled_in_proj: 将linear-attention（即 GatedDeltaNet）中的`in_proj`解耦为`in_proj_qkvz`, `in_proj_ba`，以适配FP8训练，其中`in_proj_ba`仍使用原始精度训练。参考[这个例子](https://github.com/modelscope/ms-swift/blob/main/examples/models/qwen3_5/fp8.sh)。
 - enable_dft_loss: 是否在SFT训练中使用[DFT](https://arxiv.org/abs/2508.05629) (Dynamic Fine-Tuning) loss，默认为False。
 - enable_channel_loss: 启用channel loss，默认为`False`。你需要在数据集中准备"channel"字段，ms-swift会根据该字段分组统计loss（若未准备"channel"字段，则归为默认`None` channel）。数据集格式参考[channel loss](../Customization/Custom-dataset.md#channel-loss)。channel loss兼容packing/padding_free/loss_scale等技术。
 - 🔥task_type: 默认为'causal_lm'。可选为'causal_lm'、'seq_cls'、'embedding'和'generative_reranker'。
 - num_labels: 分类模型（即`--task_type seq_cls`）需要指定该参数。代表标签数量，默认为None。
 - problem_type: 分类模型（即`--task_type seq_cls`）需要指定该参数。可选为'regression', 'single_label_classification', 'multi_label_classification'。默认为None，若模型为 reward_model 或 num_labels 为1，该参数为'regression'，其他情况，该参数为'single_label_classification'。
+- mrl_dims: Embedding训练的[Matryoshka表征学习（MRL）](https://arxiv.org/abs/2205.13147)维度配置，默认为None。格式为`Dict[int, float]`或Json字符串，key为截断的embedding维度，value为该维度对应的loss权重，例如`'{"32": 1.0, "64": 1.0, "128": 1.0}'`。开启后，trainer会对`last_hidden_state`分别截断到每个维度并做L2归一化，再调用`loss_type`对应的loss加权累加。仅在`task_type='embedding'`下生效。
+  - 注意：可支持的最大embedding维度由模型`config.json`中的`hidden_size`决定，key大于`hidden_size`的KV对将被自动忽略。
 - 🔥save_strategy: 保存策略，可选项为'steps'和'epoch'。默认为'steps'。当设置为'epoch'时，会根据数据集大小自动计算`save_steps`和`eval_steps`以实现每个epoch保存一次，用户传入的`save_steps`和`eval_steps`参数值将被忽略。
 - callbacks: 自定义trainer callback，默认为`[]`。
 
@@ -258,9 +305,10 @@ lora训练：
 
 Megatron训练参数继承自Megatron参数和基本参数（**与ms-swift共用dataset、template等参数，也支持ms-swift中的特定模型参数**）。基本参数的内容可以参考[这里](../Instruction/Command-line-parameters.md#基本参数)。此外还包括以下参数：
 
-- add_version: 在`save`上额外增加目录`'<版本号>-<时间戳>'`防止权重覆盖，默认为True。
+- add_version: 在`output_dir`上额外增加目录`'<版本号>-<时间戳>'`防止权重覆盖，默认为True。
 - 🔥create_checkpoint_symlink: 额外创建checkpoint软链接，方便书写自动化训练脚本。best_model和last_model的软链接路径分别为f'{output_dir}/best'和f'{output_dir}/last'。
-- 🔥packing: 使用`padding_free`的方式将不同长度的数据样本打包成**近似**统一长度的样本（packing能保证不对完整的序列进行切分），实现训练时各节点与进程的负载均衡（避免长文本拖慢短文本的训练速度），从而提高GPU利用率，保持显存占用稳定。当使用 `--attention_backend flash` 时，可确保packed样本内的不同序列之间相互独立，互不可见（除Qwen3-Next，因为含有linear-attention）。该参数默认为`False`。Megatron-SWIFT的所有训练任务都支持该参数。注意：**packing会导致数据集样本数减少，请自行调节梯度累加数和学习率**。
+- 🔥packing: 使用`padding_free`的方式将不同长度的数据样本打包成**近似**统一长度的样本（packing能保证不对完整的序列进行切分），实现训练时各节点与进程的负载均衡（避免长文本拖慢短文本的训练速度），从而提高GPU利用率，保持显存占用稳定。当使用 `--attention_backend flash` 时，可确保packed样本内的不同序列之间相互独立，互不可见。该参数默认为`False`。注意：**packing会导致数据集样本数减少，请自行调节梯度累加数和学习率**。
+  - linear-attention的场景：Qwen3.5, Qwen3-Next也支持padding_free/packing，参考[Qwen3.5最佳实践](../BestPractices/Qwen3_5-Best-Practice.md)。
 - packing_length: packing的长度。默认为None，设置为max_length。
 - packing_num_proc: packing的进程数，默认为1。需要注意的是，不同的`packing_num_proc`，最终形成的packed数据集是不同的。（该参数在流式packing时不生效）。通常不需要修改该值，packing速度远快于tokenize速度。
 - streaming: 流式读取并处理数据集，默认False。（流式数据集的随机并不彻底，可能导致loss波动剧烈。）
@@ -342,39 +390,48 @@ Megatron训练参数继承自Megatron参数和基本参数（**与ms-swift共用
 - overlong_filter: 跳过超长截断的样本，不参与loss计算，默认为False。
 - delta: [INTELLECT-2 tech report](https://huggingface.co/papers/2505.07291)中双侧 GRPO 上界裁剪值。若设置，建议大于 1 + epsilon。默认为None。
 - importance_sampling_level: 控制重要性采样比计算，可选项为 `token` 和 `sequence`，`token` 模式下保留原始的每个 token 的对数概率比，`sequence` 模式下则会对序列中所有有效 token 的对数概率比进行平均。[GSPO论文](https://arxiv.org/abs/2507.18071)中使用sequence级别计算来稳定训练，默认为`token`。
-- scale_rewards: 指定奖励的缩放策略。可选值包括 `group`（按组内标准差缩放）、`batch`（按整个批次的标准差缩放）、`none`（不进行缩放）、`gdpo`（对每个奖励函数分别进行组内归一化后加权聚合，参考 [GDPO 论文](https://arxiv.org/abs/2601.05242)）。在 ms-swift < 3.10 版本中，该参数为布尔类型，`true` 对应 `group`，`false` 对应 `none`。默认值与 `advantage_estimator` 绑定：`grpo` 对应 `group`，`rloo` 对应 `none`，`reinforce_plus_plus` 对应 `batch`。
+- scale_rewards: 指定奖励的缩放策略。可选值包括 `group`（按组内标准差缩放）、`batch`（按整个批次的标准差缩放）、`none`（不进行缩放）、`gdpo`（对每个奖励函数分别进行组内归一化后加权聚合，参考 [GDPO 论文](https://arxiv.org/abs/2601.05242)）。默认值与 `advantage_estimator` 绑定：`grpo` 对应 `group`，`rloo` 对应 `none`，`reinforce_plus_plus` 对应 `batch`。
   - 注意：`gdpo` 模式不支持 `kl_in_reward=True`，若同时设置会自动将 `kl_in_reward` 设为 `False`。
   - GDPO 适用于多奖励优化场景：当使用多个奖励函数时，GDPO 会对每个奖励函数分别在组内进行标准化（减均值、除标准差），然后使用 `reward_weights` 进行加权求和，最后再进行批次级别的标准化。这种方式可以更好地保留各个奖励的相对差异，避免不同奖励组合坍塌成相同的 advantage 值。
 - rollout_importance_sampling_mode: 训推不一致校正模式，可选项为 `token_truncate`、`token_mask`、`sequence_truncate`、`sequence_mask`。默认为None，不启用校正。具体参考[文档](../Instruction/GRPO/AdvancedResearch/training_inference_mismatch.md)。
 - rollout_importance_sampling_threshold: 重要性采样权重的阈值，用于截断或屏蔽极端权重。默认为2.0。
 - log_rollout_offpolicy_metrics: 当 `rollout_importance_sampling_mode` 未设置时，是否记录训推不一致诊断指标（KL、PPL、χ²等）。当设置了 `rollout_importance_sampling_mode` 时，指标会自动记录。默认为False。
 - off_policy_sequence_mask_delta: Off-Policy Sequence Masking 阈值，来自 DeepSeek-V3.2 论文。当设置此值时，会计算每个序列的 `mean(old_policy_logps - policy_logps)`，若该值大于阈值且该序列的优势为负，则 mask 掉该序列不参与损失计算。默认为None，不启用。具体参考[文档](../Instruction/GRPO/AdvancedResearch/training_inference_mismatch.md#off-policy-sequence-masking)。
+- router_replay_mode: 路由重放模式，可选项为`disabled`、`R2`、`R3`。默认为disabled，不启用路由重放。
+- teacher_kl_coef: OPD-RL中teacher_kl的系数，即 `adv_t = base_adv + teacher_kl_coef * teacher_kl`。默认为 1.0。
 
 内置奖励函数参数参考[文档](../Instruction/Command-line-parameters.md#奖励函数参数)
 
 ### GKD参数
-- teacher_model: 教师模型的路径或模型 ID，必需参数。
-- teacher_model_type: 教师模型类型，默认为None，自动检测。
-- teacher_model_revision: 教师模型版本，默认为None。
+
 - beta: JSD 散度插值系数。0.0 代表 Forward KL，0.5 代表对称 JSD，1.0 代表 Reverse KL。默认为0.5。
 - lmbda: On-Policy 学习触发概率。0.0 代表纯 Off-Policy，1.0 代表纯 On-Policy。默认为0.5。
-- seq_kd: 是否使用教师生成的响应（Sequential KD），当前暂不支持。默认为False。
 - temperature: 用于采样和损失计算的温度参数。默认为0.9。
-- offload_teacher_model: 是否将教师模型卸载到 CPU 以节省 GPU 显存。默认为False。
 - sft_alpha: SFT 损失的混合系数，`loss = jsd_loss + sft_alpha * sft_loss`。当使用数据集响应（Off-Policy）时生效。默认为0。
 - max_completion_length: 生成时的最大 token 数。默认为512。
 - vllm_mode: 同 GRPO 参数，用于 On-Policy 生成。colocate 模式下在程序内部署 vLLM。
   - 注意：On-Policy 生成需要启用 vLLM（`--use_vllm true --vllm_mode colocate/server`）。
   - 当 `lmbda > 0` 但未启用 vLLM 时，将自动回退到 Off-Policy 模式。
 
+### teacher 参数
+在GKD与GRPO中使用
+
+- teacher_model: 教师模型的路径或模型 ID，必需参数。
+- teacher_model_type: 教师模型类型，默认为None，自动检测。
+- teacher_model_revision: 教师模型版本，默认为None。
+- teacher_model_server: 教师模型服务地址，通过 `swift deploy` 部署后用于获取 logprobs，与 `teacher_model` 互斥。支持单 URL 或多 teacher JSON（`'[{"url":"...","tags":["..."]}, ...]'`）。详见[蒸馏文档](../Instruction/Distillation.md#multi-teacher多教师路由)。
+- teacher_tag_key: 多 teacher 路由时样本匹配 teacher `tags` 的字段名，默认为 `"dataset"`。
+- offload_teacher_model: 是否将教师模型卸载到 CPU 以节省 GPU 显存。默认为False。
+
+
 ## 导出参数
 这里介绍`megatron export`的参数，若要使用`swift export`导出命令，请参考[ms-swift命令行参数文档](../Instruction/Command-line-parameters.md#导出参数)。`megatron export`相比`swift export`，支持分布式和多机导出。Megatron导出参数继承自Megatron参数和基本参数。
 - 🔥to_mcore: HF格式权重转成Megatron格式。默认为False。
 - 🔥to_hf: Megatron格式权重转成HF格式。默认为False。
-- 🔥merge_lora: 默认为None，若`to_hf`设置为True，该参数默认值为`True`，否则为False。即默认情况下，存储为safetensors格式时会合并LoRA；存储为torch_dist格式时，不会合并LoRA。合并后的权重存储在`--save`目录下。
+- 🔥merge_lora: 默认为None，若`to_hf`设置为True，该参数默认值为`True`，否则为False。即默认情况下，存储为safetensors格式时会合并LoRA；存储为torch_dist格式时，不会合并LoRA。合并后的权重存储在`--output_dir`目录下。
   - 注意：transformers 5.0对Moe的模型组织结构进行了重构，该结构不支持Moe LoRA的推理，可能造成推理异常。**建议对Moe模型进行Merge LoRA**（vLLM不受影响）。
   - 注意：由于transformers和Megatron模型专家结构并不一定一致（例如transformers的Qwen3-VL-Moe的专家部分并不是Linear实现，而是Parameters），因此部分模型无法转换（若Qwen3-VL-Moe只设置linear_proj和linear_qkv训练LoRA也支持转换）。但大多数的模型支持LoRA转换，例如：Qwen3-Moe，Qwen3-Omni-Moe，GLM4.5-V等。
 - 🔥test_convert_precision: 测试HF和Megatron格式权重转换的精度误差。默认为False。
 - test_convert_dtype: 转换精度测试使用的dtype，默认为'float32'。
-- exist_ok: 如果`args.save`存在，不抛出异常，进行覆盖。默认为False。
+- exist_ok: 如果`args.output_dir`存在，不抛出异常，进行覆盖。默认为False。
 - device_map: 设置`--test_convert_precision true`时生效，控制HF模型的加载位置，默认为'auto'。你可以设置为'cpu'节约显存资源。

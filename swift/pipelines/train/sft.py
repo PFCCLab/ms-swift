@@ -5,9 +5,9 @@ from typing import List, Optional, Union
 
 from swift.arguments import SftArguments
 from swift.dataset import (AddLengthPreprocessor, DatasetLoader, EncodePreprocessor, IterablePackingDataset,
-                           LazyLLMDataset, PackingDataset, load_dataset)
+                           LazyLLMDataset, PackingDataset)
 from swift.infer_engine import prepare_generation_config
-from swift.ray import RayHelper
+from swift.ray_utils import RayHelper
 from swift.sequence_parallel import sequence_parallel
 from swift.trainers import TrainerFactory
 from swift.utils import append_to_jsonl, get_logger, get_model_parameter_info, is_master, plot_images, stat_array
@@ -78,20 +78,7 @@ class SwiftSft(SwiftPipeline, TunerMixin):
     def _get_dataset(self):
         # The random shuffling of the training set occurs in the dataloader of the trainer.
         args = self.args
-        dataset_kwargs = args.get_dataset_kwargs()
-        train_dataset, val_dataset = None, None
-        if args.dataset:
-            train_dataset, val_dataset = load_dataset(
-                args.dataset,
-                split_dataset_ratio=args.split_dataset_ratio,
-                shuffle=args.dataset_shuffle,
-                **dataset_kwargs)
-        if len(args.val_dataset) > 0:
-            # Loading val dataset
-            dataset_kwargs.pop('interleave_prob', None)
-            _, val_dataset = load_dataset(
-                args.val_dataset, split_dataset_ratio=1.0, shuffle=args.val_dataset_shuffle, **dataset_kwargs)
-            assert args.split_dataset_ratio == 0.
+        train_dataset, val_dataset = args.load_dataset()
         if args.truncation_strategy == 'split':
             logger.info(f'train_dataset: {train_dataset}')
             logger.info(f'val_dataset: {val_dataset}')
@@ -104,7 +91,7 @@ class SwiftSft(SwiftPipeline, TunerMixin):
             os.makedirs(output_dir, exist_ok=True)
             val_dataset_path = os.path.join(output_dir, 'val_dataset.jsonl')
             append_to_jsonl(val_dataset_path, val_dataset.to_list())
-            logger.info(f'The split dataset from the training set will be saved at: {val_dataset_path}.')
+            logger.info(f'The split dataset from the training set will be saved at: `{val_dataset_path}`.')
 
     @RayHelper.function(group='default')
     def _prepare_dataset(self):
@@ -156,6 +143,7 @@ class SwiftSft(SwiftPipeline, TunerMixin):
                     num_proc=args.dataset_num_proc,
                     packing_length=args.packing_length,
                     packing_num_proc=args.packing_num_proc,
+                    packing_strategy=args.packing_strategy,
                     strict=args.strict,
                     load_from_cache_file=args.load_from_cache_file)
             elif args.streaming:
@@ -243,17 +231,18 @@ class SwiftSft(SwiftPipeline, TunerMixin):
         return self.train_msg
 
     def _get_resume_checkpoint(self, trainer):
-        if self.args.resume_from_checkpoint:
-            return self.args.resume_from_checkpoint
+        args = trainer.args
+        if args.resume_from_checkpoint:
+            return args.resume_from_checkpoint
         resume_checkpoint = None
         # If flash checkpoint is enabled, try to resume from the last complete checkpoint.
         # If the previous training finished, resume_checkpoint stays None.
-        if self.args.use_flash_ckpt:
+        if args.use_flash_ckpt:
             # resume_checkpoint = <resume_dir>/checkpoint-<step>
             resume_checkpoint = trainer.get_resume_checkpoint()
 
         # Elastic runs require a universal checkpoint; fall back when missing or incomplete.
-        callbacks = set(getattr(self.args, 'callbacks', []))
+        callbacks = set(getattr(args, 'callbacks', []))
         elastic_enabled = 'deepspeed_elastic' in callbacks
         if elastic_enabled and (resume_checkpoint is None
                                 or not os.path.exists(os.path.join(resume_checkpoint, 'latest_universal'))):
@@ -319,10 +308,8 @@ class SwiftSft(SwiftPipeline, TunerMixin):
         origin_template_model = template.model
         template.model = None  # Avoid serializing the model.
         if args.truncation_strategy == 'split':
-            if (args.task_type != 'causal_lm' or template.mode != 'train' or args.use_chat_template
-                    or args.model_meta.is_multimodal):
-                raise ValueError(
-                    '`--truncation_strategy split` is currently only supported for plain text model pretraining')
+            if args.task_type != 'causal_lm' or template.mode != 'train' or args.use_chat_template:
+                raise ValueError('`--truncation_strategy split` is currently only supported for pre-training.')
             assert not args.lazy_tokenize, '`--truncation_strategy split` does not support lazy_tokenize'
 
         for i, dataset in enumerate(datasets):

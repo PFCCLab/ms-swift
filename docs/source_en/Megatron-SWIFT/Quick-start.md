@@ -1,6 +1,6 @@
 # Quick Start
 
-ms-swift incorporates Megatron's parallelization techniques to accelerate the training of large models, including data parallelism, tensor parallelism, pipeline parallelism, sequence parallelism, context parallelism, and expert parallelism. It supports CPT/SFT/DPO/GRPO for models such as Qwen3, [Qwen3-MoE](https://github.com/modelscope/ms-swift/blob/main/examples/megatron/mcore_bridge/full/moe.sh), Qwen2.5, Llama3, Deepseek-R1 and GLM4.5 series. For a complete list of supported models, please refer to the [Supported Models and Datasets documentation](../Instruction/Supported-models-and-datasets.md). We recommend using Megatron-SWIFT for MoE training; it can typically achieve a 10x speedup in training.
+ms-swift incorporates Megatron's parallelization techniques to accelerate the training of large models, including data parallelism, tensor parallelism, pipeline parallelism, sequence parallelism, context parallelism, and expert parallelism. It supports CPT/SFT/GRPO/DPO/KTO/RM for models such as Qwen3, Qwen3.5, Deepseek-R1, GLM4.5, GPT-OSS, and more. For a complete list of supported models, please refer to the [Supported Models and Datasets documentation](../Instruction/Supported-models-and-datasets.md).
 
 
 | Method                 | Full-Parameter | LoRA | MoE  | Multimodal | FP8  |
@@ -21,11 +21,12 @@ ms-swift incorporates Megatron's parallelization techniques to accelerate the tr
 To use Megatron-SWIFT, in addition to installing the `swift` dependencies, you also need to install the following:
 
 ```shell
-pip install pybind11
-
 # transformer_engine
 # If an installation error occurs, you can refer to this issue for resolution: https://github.com/modelscope/ms-swift/issues/3793
-pip install --no-build-isolation transformer_engine[pytorch]
+pip install --no-build-isolation transformer-engine[pytorch] --no-cache-dir
+# cuda13
+pip install pybind11
+pip install git+https://github.com/NVIDIA/TransformerEngine.git@stable --no-build-isolation
 
 # apex
 # Note: Megatron-SWIFT can run in environments without apex by setting `--gradient_accumulation_fusion false`.
@@ -33,18 +34,15 @@ git clone https://github.com/NVIDIA/apex
 cd apex
 pip install -v --disable-pip-version-check --no-cache-dir --no-build-isolation --config-settings "--build-option=--cpp_ext" --config-settings "--build-option=--cuda_ext" ./
 
-# megatron-core
-pip install git+https://github.com/NVIDIA/Megatron-LM.git@core_r0.15.0
+# mcore-bridge
+pip install mcore-bridge -U
+# Install from main branch
+# pip install git+https://github.com/modelscope/mcore-bridge.git
 
 # If you are using multi-node training, please additionally set the `MODELSCOPE_CACHE` environment variable to a shared storage path.
 # This will ensure that the dataset cache is shared, thereby speeding up preprocessing.
 # Note: This step is crucial; otherwise multi-machine training may hang due to data inconsistencies caused by randomness in data preprocessing.
 export MODELSCOPE_CACHE='/xxx/shared'
-
-# Megatron-LM
-# The training module in the dependent library Megatron-LM will be cloned and installed by swift via `git clone`. Alternatively, you can use the environment variable `MEGATRON_LM_PATH` to point to the path of an already downloaded repository (in offline environments, use the [core_r0.15.0 branch](https://github.com/NVIDIA/Megatron-LM/tree/core_r0.15.0)).
-git clone --branch core_r0.15.0 https://github.com/NVIDIA/Megatron-LM.git
-export MEGATRON_LM_PATH='/xxx/Megatron-LM'
 
 # flash_attn
 # Choose an appropriate version to install: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.8.3
@@ -54,31 +52,38 @@ MAX_JOBS=8 pip install "flash-attn==2.8.3" --no-build-isolation
 
 Alternatively, you can also use the image: (See historical images [here](../GetStarted/SWIFT-installation.md#mirror))
 ```
-modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.8.1-py311-torch2.9.0-vllm0.13.0-modelscope1.33.0-swift3.12.5
-modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.8.1-py311-torch2.9.0-vllm0.13.0-modelscope1.33.0-swift3.12.5
-modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.8.1-py311-torch2.9.0-vllm0.13.0-modelscope1.33.0-swift3.12.5
+# cu128
+modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.8.1-py311-torch2.10.0-vllm0.17.1-modelscope1.34.0-swift4.0.3
+modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.8.1-py311-torch2.10.0-vllm0.17.1-modelscope1.34.0-swift4.0.3
+modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.8.1-py311-torch2.10.0-vllm0.17.1-modelscope1.34.0-swift4.0.3
 
 # cu129 (fp8 training)
-modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.9.1-py311-torch2.8.0-vllm0.11.0-modelscope1.32.0-swift3.11.3
-modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.9.1-py311-torch2.8.0-vllm0.11.0-modelscope1.32.0-swift3.11.3
-modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.9.1-py311-torch2.8.0-vllm0.11.0-modelscope1.32.0-swift3.11.3
+modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.9.1-py312-torch2.10.0-vllm0.19.1-modelscope1.35.4-swift4.1.3
+modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.9.1-py312-torch2.10.0-vllm0.19.1-modelscope1.35.4-swift4.1.3
+modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.9.1-py312-torch2.10.0-vllm0.19.1-modelscope1.35.4-swift4.1.3
+
+# cu130 (fp8 training)
+modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda13.0.3-py312-torch2.11.0-vllm0.23.0-modelscope1.37.1-swift4.3.2
+modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda13.0.3-py312-torch2.11.0-vllm0.23.0-modelscope1.37.1-swift4.3.2
+modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda13.0.3-py312-torch2.11.0-vllm0.23.0-modelscope1.37.1-swift4.3.2
 ```
 
 Recommended Operating Environment:
 
 |        | Range | Recommended | Notes |
 |--------------|--------------|-------------|--------------------|
-| python       | >=3.9        | 3.10/3.11        |                    |
-| cuda         |              | cuda12      |                    |
-| torch        | >=2.0        | 2.8.0    |                    |
-| transformer_engine    | >=2.3       |  2.10.0  |                  |
+| python       | >=3.10        | 3.12    |                    |
+| cuda         |              | cuda12.8/13.0   |                    |
+| torch        | >=2.0        | 2.8.0/2.11.0    |                    |
+| transformer-engine    | >=2.3       |  2.16.0  |                  |
 | apex |   |  0.1 | |
-| megatron_core    |    >=0.12,<0.16    | 0.15      |                  |
-| flash_attn    |        | 2.8.3/3.0.0b1   |                  |
-| transformers | >=4.33       | 4.57.6      |                    |
+| megatron-core    |    >=0.16,<0.20    | 0.17.1      |                  |
+| mcore-bridge    |    >=1.3.0    |   1.5.0   |                  |
+| flash-attn    |        | 2.8.3/4.0.0b15   |                  |
+| transformers | >=4.33       | 4.57.6/5.12.1    |                    |
 | modelscope   | >=1.23       |             |                    |
-| peft         | >=0.11,<0.19 |             |      LoRA          |
-| trl          | >=0.15,<0.29 |       |      RLHF        |
+| peft         | >=0.11,<0.20 |             |      LoRA          |
+| trl          | >=0.15,<1.0 |       |      RLHF        |
 
 
 ## Quick Start Example
@@ -102,7 +107,7 @@ swift export \
 ```
 
 Next, use the following script to start training. The required GPU memory resources are 2*80GiB:
-- If using multi-machine training, it is recommended to share a disk and specify the same path for `--save`.
+- If using multi-machine training, it is recommended to share a disk and specify the same path for `--output_dir`.
 ```shell
 PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
 NPROC_PER_NODE=2 \
@@ -169,6 +174,9 @@ The inference results are as follows:
 <<< who are you?
 I am a language model developed by swift, you can call me swift-robot. How can I assist you?
 ```
+
+For Megatron-Ray Training, refer to this [doc](../Instruction/Ray.md)
+
 
 ### Mcore-Bridge [Recommended]
 
@@ -239,7 +247,7 @@ swift infer \
 
 
 ## Benchmark
-The training speed comparison for full-parameter dense models with 8K context length, using `megatron sft` and `swift sft`, under a single-node, eight-GPU A800 environment is as follows:
+The training speed comparison for full-parameter dense models with 8K context length, using `megatron sft` and `swift sft`, under a single-node, eight-GPU A800 environment is as follows: ([shell](https://github.com/modelscope/ms-swift/blob/main/examples/megatron/benchmark/deepspeed.sh))
 
 **Dense** Qwen2.5-14B:
 
@@ -253,6 +261,8 @@ The training speed comparison for full-parameter dense models with 8K context le
 The training speed comparison for full-parameter MoE models with 8K context length, using `megatron sft` and `swift sft`, under a two-node, 16-GPU A800 environment is as follows:
 
 **MoE** Qwen3-30B-A3B:
+
+- Note: The DeepSpeed test results were conducted in a "transformers<5.0" environment. In "transformers>5.0", training can be accelerated by using `--experts_impl grouped_mm`.
 
 |                  | Megatron-LM | Deepspeed-ZeRO2 | Deepspeed-ZeRO3 |
 | ---------------- | ----------- | --------------- | --------------- |

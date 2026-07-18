@@ -2,17 +2,43 @@
 import base64
 import io
 import json
+import numpy as np
 import os
 import time
 import uuid
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields
 from PIL import Image
-from pydantic import BaseModel, Field, field_validator
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from pydantic import AfterValidator, BaseModel, Field, PlainSerializer, field_validator
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 
 from swift.template import Messages, Tool
 from swift.utils import remove_response
+
+
+def serialize_ndarray(value):
+    if value is None:
+        return None
+    if isinstance(value, np.ndarray):
+        return {
+            'data': base64.b64encode(value.tobytes()).decode('ascii'),
+            'shape': value.shape,
+            'dtype': str(value.dtype),
+            '__ndarray__': True
+        }
+    return value
+
+
+def deserialize_ndarray(value):
+    if value is None:
+        return None
+    if isinstance(value, dict) and value.get('__ndarray__'):
+        data = base64.b64decode(value['data'])
+        return np.frombuffer(data, dtype=value['dtype']).reshape(value['shape'])
+    return value
+
+
+NumpyArray = Annotated[Any, PlainSerializer(serialize_ndarray, return_type=Dict), AfterValidator(deserialize_ndarray)]
 
 
 @dataclass
@@ -65,6 +91,7 @@ class InferRequest:
 
     tools: Optional[List[Tool]] = None
     objects: Dict[str, Any] = field(default_factory=dict)
+    chat_template_kwargs: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         for key in ['images', 'audios', 'videos']:
@@ -172,6 +199,7 @@ class RequestConfig:
     stream: bool = False
     logprobs: bool = False
     top_logprobs: Optional[int] = None
+    prompt_logprobs: Optional[int] = None
 
     n: int = 1
     best_of: Optional[int] = None
@@ -207,6 +235,7 @@ class ChatCompletionRequestMixin:
     messages: Messages
     tools: Optional[List[Tool]] = None
     tool_choice: Optional[Union[str, Dict]] = None
+    chat_template_kwargs: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.tool_choice is None:
@@ -392,6 +421,7 @@ class ChatCompletionResponseChoice:
     finish_reason: Literal['stop', 'length', None]
     logprobs: Optional[Dict[str, List[Dict[str, Any]]]] = None
     token_ids: Optional[List[int]] = None
+    routed_experts: Optional[NumpyArray] = None
 
     def to_cmpl_choice(self) -> 'CompletionResponseChoice':
         self = deepcopy(self)
@@ -433,13 +463,22 @@ class ChatCompletionResponse:
     object: str = 'chat.completion'
     created: int = field(default_factory=lambda: int(time.time()))
     prompt_token_ids: Optional[List[int]] = None
+    prompt_logprobs: Optional[List] = None
     images_size: Optional[List[Tuple[int, int]]] = None
 
     def to_cmpl_response(self) -> 'CompletionResponse':
         self = deepcopy(self)
         choices = [choice.to_cmpl_choice() for choice in self.choices]
         id_ = f'cmpl{self.id[len("chatcmpl"):]}'
-        return CompletionResponse(self.model, choices, self.usage, id_, created=self.created)
+        return CompletionResponse(
+            self.model,
+            choices,
+            self.usage,
+            id_,
+            created=self.created,
+            prompt_token_ids=self.prompt_token_ids,
+            prompt_logprobs=self.prompt_logprobs,
+        )
 
 
 class RolloutOutput(BaseModel):
@@ -478,6 +517,8 @@ class RolloutOutput(BaseModel):
     # rollout logprobs for each turn (used for rollout importance sampling correction in multi-turn scenarios)
     rollout_logprobs: List[List[float]] = Field(default_factory=list)
 
+    prompt_logprobs: Optional[List] = None
+
     @field_validator('response_token_ids', 'response_loss_mask', 'rollout_logprobs', mode='before')
     @classmethod
     def _wrap_flat_list(cls, v):
@@ -510,6 +551,8 @@ class CompletionResponse:
     id: str = field(default_factory=lambda: f'cmpl-{random_uuid()}')
     object: str = 'text_completion'
     created: int = field(default_factory=lambda: int(time.time()))
+    prompt_token_ids: Optional[List[int]] = None
+    prompt_logprobs: Optional[List] = None
 
 
 @dataclass

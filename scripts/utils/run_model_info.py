@@ -1,3 +1,4 @@
+from itertools import chain
 from typing import Any, List
 
 from swift.model import MODEL_MAPPING, ModelType
@@ -9,6 +10,9 @@ def get_url_suffix(model_id):
     if ':' in model_id:
         return model_id.split(':')[0]
     return model_id
+
+
+supported_mcore_model_types = None
 
 
 def get_cache_mapping(fpath):
@@ -30,6 +34,7 @@ def get_cache_mapping(fpath):
 
 
 def get_model_info_table():
+    global supported_mcore_model_types
     fpaths = [
         'docs/source/Instruction/Supported-models-and-datasets.md',
         'docs/source_en/Instruction/Supported-models-and-datasets.md'
@@ -37,9 +42,9 @@ def get_model_info_table():
     cache_mapping = get_cache_mapping(fpaths[0])
     end_words = [['### 多模态大模型', '## 数据集'], ['### Multimodal large models', '## Datasets']]
     result = [
-        '| Model ID | Model Type | Default Template | '
+        '| Model ID | Model Type | Default Template | Default Agent Template | '
         'Requires | Support Megatron | Tags | HF Model ID |\n'
-        '| -------- | -----------| ---------------- | '
+        '| -------- | -----------| ---------------- | ---------------------- | '
         '-------- | ---------------- | ---- | ----------- |\n'
     ] * 2
     res_llm: List[Any] = []
@@ -66,16 +71,24 @@ def get_model_info_table():
                 tags = ', '.join(group.tags or model_meta.tags) or '-'
                 requires = ', '.join(group.requires or model_meta.requires) or '-'
                 template = group.template or model_meta.template
+                template_meta = TEMPLATE_MAPPING.get(template)
+                agent_template = template_meta.agent_template if template_meta else ''
+                agent_template = agent_template or ''
                 if is_megatron_available():
-                    from swift.megatron import model
-                    support_megatron = getattr(model_meta, 'support_megatron', False)
+                    from mcore_bridge.model import MODEL_MAPPING as MCORE_MODEL_MAPPING
+                    if supported_mcore_model_types is None:
+                        supported_mcore_model_types = set(
+                            list(chain.from_iterable([v.model_types for k, v in MCORE_MODEL_MAPPING.items()])))
+                    if model_meta.mcore_model_type is not None:
+                        support_megatron = True
+                    elif model_meta.model_type in supported_mcore_model_types:
+                        support_megatron = True
+                    else:
+                        support_megatron = False
                     for word in ['gptq', 'awq', 'bnb', 'aqlm', 'int4', 'int8', 'nf4']:
                         if word in ms_model_id.lower():
                             support_megatron = False
                             break
-                    if support_megatron and 'fp8' in ms_model_id.lower() and not any(
-                            word in ms_model_id.lower() for word in ['qwen', 'longcat', 'intern']):
-                        support_megatron = False
                     support_megatron = '&#x2714;' if support_megatron else '&#x2718;'
                 else:
                     support_megatron = cache_mapping.get(ms_model_id, '&#x2718;')
@@ -84,7 +97,8 @@ def get_model_info_table():
                         mg_count_mllm += 1
                     else:
                         mg_count_llm += 1
-                r = f'|{ms_model_id}|{model_type}|{template}|{requires}|{support_megatron}|{tags}|{hf_model_id}|\n'
+                r = (f'|{ms_model_id}|{model_type}|{template}|{agent_template}|{requires}|'
+                     f'{support_megatron}|{tags}|{hf_model_id}|\n')
                 if model_meta.is_multimodal:
                     res_mllm.append(r)
                 else:

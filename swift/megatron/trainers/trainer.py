@@ -19,8 +19,6 @@ class MegatronTrainer(BaseMegatronTrainer):
 
     def seq_cls_loss_func(self, output_tensor, *, labels: torch.Tensor, packed_seq_params=None, attention_mask=None):
         args = self.args
-        if args.context_parallel_size > 1:
-            raise ValueError('Currently `task_type="seq_cls"` does not support context parallelism.')
         logits = self.get_last_tokens(output_tensor, packed_seq_params, attention_mask)
         num_labels = args.num_labels
         acc = None
@@ -64,20 +62,12 @@ class MegatronTrainer(BaseMegatronTrainer):
             losses = losses * loss_scale
         loss = torch.cat([torch.sum(losses * loss_mask).view(1), loss_mask.sum().view(1)])
 
-        if args.context_parallel_size > 1 and not self.mcore_013:
-            loss = all_reduce(loss, group=mpu.get_context_parallel_group())
-
         # Reduce loss for logging.
         reporting_loss = loss.detach().clone()
-        torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
+        torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group(with_context_parallel=True))
 
         lm_loss = loss[0]
-        if not self.mcore_013:
-            # fix megatron-lm bug
-            # https://github.com/NVIDIA/Megatron-LM/blob/core_r0.12.0/megatron/core/pipeline_parallel/schedules.py#L291
-            lm_loss = lm_loss / mpu.get_context_parallel_world_size()
-        else:
-            lm_loss = lm_loss.clone()
+        lm_loss = lm_loss.clone()
         local_num_tokens = loss[1].detach().clone().to(torch.int)
         metrics = {'loss': reporting_loss}
         if args.enable_channel_loss:
@@ -88,7 +78,7 @@ class MegatronTrainer(BaseMegatronTrainer):
         args = self.args
         metrics = defaultdict(lambda: torch.tensor([0.0, 0.0], dtype=torch.float32, device=torch.cuda.current_device()))
         if args.padding_free:
-            num_samples = packed_seq_params.num_samples
+            num_samples = packed_seq_params.seq_lens.shape[0]
             cu_seqlens = packed_seq_params.cu_seqlens_q[:num_samples + 1] // args.context_parallel_size
             for i in range(cu_seqlens.shape[0] - 1):
                 channel = None if channels is None else channels[i]
@@ -104,16 +94,16 @@ class MegatronTrainer(BaseMegatronTrainer):
                 metrics[f'loss_{channel}'][1] += c_loss.shape[0]
 
         # Synchronize keys to avoid getting stuck.
-        all_keys = [None] * mpu.get_data_parallel_world_size()
-        dist.all_gather_object(all_keys, list(metrics.keys()), group=mpu.get_data_parallel_group())
+        dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+        all_keys = [None] * torch.distributed.get_world_size(group=dp_cp_group)
+        dist.all_gather_object(all_keys, list(metrics.keys()), group=dp_cp_group)
         new_metrics = {}
         for key in sorted(set().union(*all_keys)):
             new_metrics[key] = metrics[key]
-        new_metrics = self._all_reduce_metric(new_metrics, torch.distributed.ReduceOp.SUM)
+        new_metrics = self._all_reduce_metric(new_metrics, torch.distributed.ReduceOp.SUM, group=dp_cp_group)
         return new_metrics
 
     def forward_step(self, data_iterator, model):
-        # Get the batch.
         vp_stage = model.module.module.vp_stage
         data = self.get_batch(data_iterator, vp_stage)
         loss_scale = data.pop('loss_scale', None)
@@ -128,7 +118,8 @@ class MegatronTrainer(BaseMegatronTrainer):
                 self.seq_cls_loss_func,
                 labels=labels,
                 packed_seq_params=packed_seq_params,
-                attention_mask=data.get('attention_mask'))
+                attention_mask=data.get('attention_mask')
+                if data.get('attention_mask') is not None else data.get('attention_mask_2d'))
         else:
             loss_func = partial(
                 self.loss_func,

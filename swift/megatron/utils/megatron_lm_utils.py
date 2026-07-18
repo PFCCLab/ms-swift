@@ -10,13 +10,15 @@ import torch
 from argparse import Namespace
 from contextlib import contextmanager
 from datetime import timedelta
-from megatron.core import dist_checkpointing, mpu, tensor_parallel
+from mcore_bridge import set_random_seed, split_cp_inputs, unwrap_model
+from megatron.core import dist_checkpointing, mpu, parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.dist_checkpointing.serialization import (get_default_load_sharded_strategy,
                                                             get_default_save_sharded_strategy)
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue, AsyncRequest
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (FullyParallelLoadStrategyWrapper,
                                                                         FullyParallelSaveStrategyWrapper)
+from megatron.core.dist_checkpointing.strategies.torch import TorchDistLoadShardedStrategy, TorchDistSaveShardedStrategy
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
@@ -26,20 +28,19 @@ from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import get_torch_version, is_te_min_version, is_torch_min_version
 from packaging import version
-from typing import Optional
+from transformers.utils import is_torch_npu_available
+from typing import Any, Dict, Optional
 
-from swift.utils import check_json_format, get_logger, init_process_group, is_master, seed_everything, set_device
+from swift.utils import check_json_format, get_logger, init_process_group, is_master, set_device
 from .patcher import patch_merge_fn
 
 logger = get_logger()
 
-mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
+mcore_017 = version.parse(megatron.core.__version__) >= version.parse('0.17.0rc0')
 
 
 @contextmanager
 def _patch_megatron_timeout(distributed_timeout_minutes):
-    from megatron.core import parallel_state
-
     origin_create_group = parallel_state.create_group
 
     def create_group(ranks=None, timeout=None, *_args, **kwargs):
@@ -80,28 +81,6 @@ def _initialize_mpu(args):
             logger.info(f'TP: {args.tensor_model_parallel_size}, PP: {args.pipeline_model_parallel_size}, '
                         f'VPP: {args.virtual_pipeline_model_parallel_size}, CP: {args.context_parallel_size}, '
                         f'EP: {args.expert_model_parallel_size}, ETP: {args.expert_tensor_parallel_size}')
-
-
-def set_random_seed(
-    seed_: int,
-    data_parallel_random_init: bool = False,
-    te_rng_tracker: bool = False,
-    inference_rng_tracker: bool = False,
-    use_cudagraphable_rng: bool = False,
-):
-    """Set random seed for reproducability."""
-    if seed_ is not None and seed_ > 0:
-        # Ensure that different pipeline MP stages get different seeds.
-        seed = seed_ + (1009 * mpu.get_pipeline_model_parallel_rank())
-        # Ensure different data parallel ranks get different seeds
-        if data_parallel_random_init:
-            seed = seed + (11 * mpu.get_data_parallel_rank())
-        seed_everything(seed)
-        if torch.cuda.device_count() > 0:
-            tensor_parallel.model_parallel_cuda_manual_seed(seed, te_rng_tracker, inference_rng_tracker,
-                                                            use_cudagraphable_rng)
-    else:
-        raise ValueError('Seed ({}) should be a positive integer.'.format(seed_))
 
 
 def initialize_megatron(args):
@@ -165,10 +144,8 @@ def _generate_state_dict(args,
         state_dict[key] = model_sd
 
     if not args.no_save_optim:
-        if not mcore_013:
-            optim_sd_kwargs = None
         if optimizer is not None:
-            state_dict['optimizer'] = optimizer.sharded_state_dict(state_dict, **(optim_sd_kwargs or {}))
+            state_dict['optimizer'] = _optimizer_sharded_state_dict(optimizer, state_dict, optim_sd_kwargs or {})
         if opt_param_scheduler is not None:
             state_dict['opt_param_scheduler'] = opt_param_scheduler.state_dict()
 
@@ -177,9 +154,24 @@ def _generate_state_dict(args,
     return state_dict
 
 
-def _filter_adapter_state_dict(state_dict, is_peft_format: bool, adapter_name: str = 'default'):
+def _optimizer_sharded_state_dict(optimizer, state_dict, optim_sd_kwargs):
+    if is_torch_npu_available():
+        from swift.model.npu_patch.megatron_checkpoint import optimizer_sharded_state_dict
+        return optimizer_sharded_state_dict(optimizer, state_dict, **optim_sd_kwargs)
+    return optimizer.sharded_state_dict(state_dict, **optim_sd_kwargs)
+
+
+def _load_optimizer_state_dict(optimizer, state_dict):
+    if is_torch_npu_available():
+        from swift.model.npu_patch.megatron_checkpoint import load_optimizer_state_dict
+        load_optimizer_state_dict(optimizer, state_dict)
+        return
+    optimizer.load_state_dict(state_dict)
+
+
+def _filter_adapter_state_dict(state_dict, peft_format: bool, adapter_name: str = 'default'):
     """
-    When is_peft_format is True, keep only the PEFT format state_dict;
+    When peft_format is True, keep only the PEFT format state_dict;
     when False, remove the PEFT format state_dict.
 
     This function ensures it is called when tuner_type != 'full'.
@@ -199,7 +191,7 @@ def _filter_adapter_state_dict(state_dict, is_peft_format: bool, adapter_name: s
         new_state_dict = {}
         state_dict_model = state_dict[model_key]
         for k, v in state_dict_model.items():
-            if is_peft_format:
+            if peft_format:
                 if '.lora_A.' in k or '.lora_B.' in k or '.modules_to_save.' in k:
                     new_state_dict[k] = v
             else:
@@ -250,7 +242,7 @@ def save_mcore_checkpoint(
     opt_param_scheduler=None,
     iteration=1,
     output_dir: Optional[str] = None,
-    is_peft_format: bool = False,
+    peft_format: bool = False,
 ):
     if output_dir is None:
         output_dir = args.output_dir
@@ -270,24 +262,36 @@ def save_mcore_checkpoint(
         model_sd_kwargs={'metadata': sharded_sd_metadata},
         optim_sd_kwargs={'metadata': sharded_sd_metadata},
     )
-    _filter_adapter_state_dict(state_dict, is_peft_format)
-
-    save_strategy = get_default_save_sharded_strategy()
+    _filter_adapter_state_dict(state_dict, peft_format)
+    if mcore_017:
+        save_strategy = TorchDistSaveShardedStrategy()
+    else:
+        save_strategy = get_default_save_sharded_strategy()
     save_strategy = FullyParallelSaveStrategyWrapper(
         save_strategy,
         mpu.get_data_parallel_group(with_context_parallel=True),
     )
-    kwargs = {'content_metadata': sharded_sd_metadata} if mcore_013 else {}
-    async_save_request = dist_checkpointing.save(
-        state_dict,
-        checkpoint_dir,
-        save_strategy,
-        async_sharded_save=args.async_save,
-        validate_access_integrity=True,
-        preprocess_common_before_consistancy_check=_preprocess_common_before_consistancy_check,
-        **kwargs)
+    kwargs = {'content_metadata': sharded_sd_metadata}
+    async_save = args.async_save
+    if not models:  # save GPU memory
+        assert 'optimizer' not in state_dict
+        async_save = False
+        common_path = os.path.join(checkpoint_dir, 'common.pt')
+        if is_master():
+            state_dict.update(kwargs)
+            torch.save(state_dict, common_path)
+        async_save_request = None
+    else:
+        async_save_request = dist_checkpointing.save(
+            state_dict,
+            checkpoint_dir,
+            save_strategy,
+            async_sharded_save=async_save,
+            validate_access_integrity=True,
+            preprocess_common_before_consistancy_check=_preprocess_common_before_consistancy_check,
+            **kwargs)
 
-    if not args.async_save:
+    if not async_save:
         assert async_save_request is None
         # Wait so everyone is done (necessary)
         if torch.distributed.is_initialized():
@@ -304,16 +308,15 @@ def save_mcore_checkpoint(
             f.write(str(iteration))
 
         def iter_finalize_fn():
-            if models:
-                logger.info(f'Successfully saved Megatron model weights in `{output_dir}`.')
+            logger.info(f'Successfully saved Megatron model weights in `{output_dir}`.')
 
-        if args.async_save:
+        if async_save:
             assert async_save_request is not None
             async_save_request.add_finalize_fn(iter_finalize_fn)
         else:
             iter_finalize_fn()
 
-    if args.async_save:
+    if async_save:
         schedule_async_save(async_save_request)
 
 
@@ -382,19 +385,20 @@ def load_mcore_checkpoint(args,
                           load_arg: str = 'mcore_model',
                           adapter_name: str = 'default'):
     if load_arg in {'mcore_adapter', 'mcore_ref_adapter'}:
-        is_peft_format = True
+        peft_format = True
     else:
         # 'mcore_model', 'mcore_ref_model'
-        is_peft_format = False
+        peft_format = False
     load_dir = getattr(args, load_arg)
 
     no_load_optim = args.no_load_optim
     no_load_rng = args.no_load_rng
     finetune = args.finetune
-    if not is_peft_format and args.tuner_type != 'full':
+    if not peft_format and args.tuner_type != 'full':
+        # When training with LoRA and loading the base model
         no_load_optim = True
         no_load_rng = True
-        finetune = False
+        finetune = True
     models = unwrap_model(ddp_models)
     tracker_path = os.path.join(load_dir, 'latest_checkpointed_iteration.txt')
     iteration = _load_iteration(tracker_path)
@@ -444,11 +448,15 @@ def load_mcore_checkpoint(args,
         iteration=iteration,
         model_sd_kwargs=model_sd_kwargs,
         optim_sd_kwargs=optim_sd_kwargs)
-    _filter_adapter_state_dict(sharded_state_dict, is_peft_format, adapter_name=adapter_name)
+    _filter_adapter_state_dict(sharded_state_dict, peft_format, adapter_name=adapter_name)
     model_keys = [k for k in sharded_state_dict.keys() if k.startswith('model')]  # compat vpp
     for k in model_keys:
         patch_merge_fn(sharded_state_dict[k])
-    load_strategy = get_default_load_sharded_strategy(checkpoint_dir)
+    if mcore_017:
+        load_strategy = TorchDistLoadShardedStrategy()
+    else:
+        load_strategy = get_default_load_sharded_strategy(checkpoint_dir)
+
     load_strategy = FullyParallelLoadStrategyWrapper(load_strategy,
                                                      mpu.get_data_parallel_group(with_context_parallel=True))
     state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_dir, load_strategy)
@@ -468,7 +476,7 @@ def load_mcore_checkpoint(args,
 
     if not finetune and not no_load_optim:
         if optimizer is not None:
-            optimizer.load_state_dict(state_dict['optimizer'])
+            _load_optimizer_state_dict(optimizer, state_dict['optimizer'])
         if opt_param_scheduler is not None:
             opt_param_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
     elif (args.fp16 or args.bf16) and optimizer is not None:
@@ -501,8 +509,7 @@ def wrap_model(args, models, wrap_with_ddp: bool = True):
     for m in models:
         for param in m.parameters():
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
-        if not args.use_cpu_initialization:
-            m.cuda(torch.cuda.current_device())
+        m.cuda(torch.cuda.current_device())
     # Fp16
     config = models[0].config
     if args.fp16 or args.bf16:
@@ -510,11 +517,17 @@ def wrap_model(args, models, wrap_with_ddp: bool = True):
 
     # DDP
     if not wrap_with_ddp:
-        return
+        return models
+
     kwargs = {}
     for f in dataclasses.fields(DistributedDataParallelConfig):
         if hasattr(args, f.name):
             kwargs[f.name] = getattr(args, f.name)
+
+    # compat: SWIFT keeps the user-facing Megatron-LM arg name, while MCore
+    # DistributedDataParallelConfig expects grad_reduce_in_fp32.
+    if hasattr(args, 'accumulate_allreduce_grads_in_fp32'):
+        kwargs['grad_reduce_in_fp32'] = args.accumulate_allreduce_grads_in_fp32
     kwargs['check_for_nan_in_grad'] = True
     # 精度对齐：DistributedDataParallelConfig 的字段名是 grad_reduce_in_fp32，而 swift args
     # 只有 accumulate_allreduce_grads_in_fp32（原生 training.py 才把二者做映射，swift 这条
@@ -537,7 +550,10 @@ def wrap_model(args, models, wrap_with_ddp: bool = True):
     if not ddp_config.overlap_grad_reduce:
         ddp_config.bucket_size = None
 
-    with torch.cuda.stream(torch.cuda.Stream()):
+    # Setup stream for DDP initialization with proper synchronization.
+    ddp_stream = torch.cuda.Stream()
+    ddp_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(ddp_stream):
         models = [
             DDP(
                 config=config,
@@ -548,6 +564,8 @@ def wrap_model(args, models, wrap_with_ddp: bool = True):
                 disable_bucketing=(model_chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step,
             ) for (model_chunk_idx, model_chunk) in enumerate(models)
         ]
+    # Ensure DDP initialization completes before proceeding on the default stream.
+    torch.cuda.current_stream().wait_stream(ddp_stream)
 
     # Broadcast params from data parallel src rank to other data parallel ranks.
     if args.data_parallel_random_init:
@@ -588,31 +606,6 @@ def get_optimizer_param_scheduler(args, optimizer):
     )
 
     return opt_param_scheduler
-
-
-def unwrap_model(models, module_instances=None):
-    """Unwrap_model to return the final model instance"""
-    try:
-        from megatron.core.utils import unwrap_model
-        return unwrap_model(models, module_instances)
-    except ImportError:
-        pass
-    if module_instances is None:
-        from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
-        module_instances = (DDP, torch_FSDP, Float16Module)
-
-    return_list = True
-    if not isinstance(models, list):
-        models = [models]
-        return_list = False
-    unwrapped_model = []
-    for model in models:
-        while isinstance(model, module_instances):
-            model = model.module
-        unwrapped_model.append(model)
-    if not return_list:
-        return unwrapped_model[0]
-    return unwrapped_model
 
 
 def should_disable_forward_pre_hook(args):
@@ -718,3 +711,37 @@ def warmup_jit_function(config, args):
             output = bias_dropout_add_fused_train([input_tensor, bias], residual, dropout_rate)
     del bias, input_tensor, residual, output
     torch.cuda.empty_cache()
+
+
+def get_batch_on_this_cp_rank(args, batch: Dict[str, Any]):
+    """Slice batch input along sequence dimension into multiple chunks,
+    which are parallelized across GPUs in a context parallel group.
+    """
+
+    # With causal masking, each token only attends to its prior tokens. Simply split
+    # sequence into CP chunks can result in severe load imbalance. That's to say, chunks
+    # at the end of sequence have bigger workload than others. To address this issue,
+    # we split sequence into 2*CP ranks. Assuming CP=2, we then get 4 chunks, chunk_0
+    # and chunk_3 are assigned to GPU0, chunk_1 and chunk_2 are assigned to GPU1, so
+    # that we can get balanced workload among GPUs in a context parallel group.
+    cp_size = mpu.get_context_parallel_world_size()
+    if cp_size > 1:
+        keys = ['labels', 'position_ids', 'loss_scale']
+        if not args.is_multimodal:
+            # Multimodal models will handle CP in input_embeds.
+            keys.append('input_ids')
+
+        packed_seq_params = batch.get('packed_seq_params')
+        for key, val in batch.items():
+            if key not in keys:
+                continue
+            if args.task_type in ('seq_cls', 'embedding', 'generative_reranker') and key == 'labels':
+                continue
+            if val is not None:
+                batch[key] = split_cp_inputs(val, getattr(packed_seq_params, 'cu_seqlens_q', None), -1)
+        attention_mask = batch.get('attention_mask')
+        if is_torch_npu_available() and attention_mask is not None and attention_mask.ndim >= 4:
+            batch['attention_mask'] = split_cp_inputs(attention_mask, getattr(packed_seq_params, 'cu_seqlens_q', None),
+                                                      -2)
+
+    return batch
