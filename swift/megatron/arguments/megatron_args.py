@@ -502,6 +502,12 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     optimizer_offload_fraction: float = 1.
     optimizer_cuda_graph: bool = False
     use_precision_aware_optimizer: bool = False
+    # Master switch for PaddleFleet<->Megatron bit-alignment patches contributed by
+    # ningzhengsheng in ms-swift and Megatron-LM. When True the patched (accuracy-aligned)
+    # code paths are enabled; when False every patched site falls back to the original logic.
+    # Exported to the `USE_ACCURACY_COMPATIBLE` env var in __post_init__ so both ms-swift and
+    # Megatron-LM core (incl. standalone/autograd functions without config access) can read it.
+    use_accuracy_compatible: bool = False
     main_grads_dtype: Literal['fp32', 'bf16'] = 'fp32'
     main_params_dtype: Literal['fp32', 'fp16'] = 'fp32'
     exp_avg_dtype: Literal['fp32', 'fp16', 'bf16', 'fp8'] = 'fp32'
@@ -769,7 +775,29 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
         RLHFMegatronArgumentsMixin.__post_init__(self)
         MegatronTunerMixin.__post_init__(self)
         os.environ.setdefault('CUDA_DEVICE_MAX_CONNECTIONS', '1')
+        # Propagate the accuracy-alignment switch to a process-wide env var so that both
+        # ms-swift and Megatron-LM patched code paths (including moe_utils standalone /
+        # autograd functions that have no config access) can gate on a single source.
+        os.environ['USE_ACCURACY_COMPATIBLE'] = '1' if self.use_accuracy_compatible else '0'
+        if self.use_accuracy_compatible:
+            # The dummy (Empty) template meta is instantiated at *import* time, which happens
+            # before this env var is set, so its `suffix` field may have been baked with the
+            # default eos token ([['eos_token_id']]). That extra eos changes the tokenized
+            # input and breaks bit-alignment with PaddleFleet from the very first layer.
+            # The template is only materialized later (via a deepcopy of this registered meta),
+            # so re-syncing the singleton's suffix here is sufficient and does not depend on
+            # the launch script exporting the env var before the interpreter starts.
+            try:
+                from swift.template.constant import LLMTemplateType
+                from swift.template.register import TEMPLATE_MAPPING
+                dummy_meta = TEMPLATE_MAPPING.get(LLMTemplateType.dummy)
+                if dummy_meta is not None:
+                    dummy_meta.suffix = []
+            except Exception as e:  # pragma: no cover - defensive, never block startup
+                logger.warning(f'Failed to sync dummy template suffix for use_accuracy_compatible: {e}')
+
         self._check_mcore_bridge()
+
         if self.recompute_granularity == 'none':
             self.recompute_granularity = None
         if self.recompute_granularity == 'selective' and self.recompute_method is not None:

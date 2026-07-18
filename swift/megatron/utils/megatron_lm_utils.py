@@ -529,6 +529,14 @@ def wrap_model(args, models, wrap_with_ddp: bool = True):
     if hasattr(args, 'accumulate_allreduce_grads_in_fp32'):
         kwargs['grad_reduce_in_fp32'] = args.accumulate_allreduce_grads_in_fp32
     kwargs['check_for_nan_in_grad'] = True
+    # 精度对齐：DistributedDataParallelConfig 的字段名是 grad_reduce_in_fp32，而 swift args
+    # 只有 accumulate_allreduce_grads_in_fp32（原生 training.py 才把二者做映射，swift 这条
+    # 入口没有），导致 fp32 累积开关丢失，main_grad 退回到 bf16 累积，与 PF 侧 fp32 累积不一致。
+    # 这里在 accuracy-compatible 下把 accumulate_allreduce_grads_in_fp32 显式映射到
+    # grad_reduce_in_fp32，让 embedding 等 bf16 权重的 main_grad 走 fp32 累积。
+    from megatron.core.transformer.module import _use_accuracy_compatible
+    if _use_accuracy_compatible() and getattr(args, 'accumulate_allreduce_grads_in_fp32', False):
+        kwargs['grad_reduce_in_fp32'] = True
     ddp_config = DistributedDataParallelConfig(**kwargs)
 
     # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
