@@ -10,6 +10,7 @@ from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from typing import List, Optional
 
 from swift.utils import get_logger
+from ..init import _use_accuracy_compatible_enabled
 from .base import BaseMegatronTrainer
 
 logger = get_logger()
@@ -69,6 +70,19 @@ class MegatronTrainer(BaseMegatronTrainer):
         lm_loss = loss[0]
         lm_loss = lm_loss.clone()
         local_num_tokens = loss[1].detach().clone().to(torch.int)
+
+        if _use_accuracy_compatible_enabled():
+            # 精度对齐锚点 2（对应 PF language_loss.py forward_impl 出口的 final_loss）：
+            # 本 rank、本 micro-batch 的 sum(loss*mask)/valid_tokens，
+            # 未跨 DP all-reduce、未除 num_microbatches，与 PF 侧同语义。
+            import hashlib as _hashlib
+            _final = (loss[0].detach().float() / loss[1].detach().float().clamp(min=1)).contiguous()
+            print(
+                f"\nfinal_loss: rank={torch.distributed.get_rank()} "
+                f"val={_final.item():.20f} "
+                f"md5={_hashlib.md5(_final.cpu().numpy().tobytes()).hexdigest()}",
+                flush=True)
+
         metrics = {'loss': reporting_loss}
         if args.enable_channel_loss:
             metrics.update(self._compute_channel_loss(losses, loss_mask, channels, packed_seq_params))
