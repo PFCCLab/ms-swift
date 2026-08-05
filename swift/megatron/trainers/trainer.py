@@ -125,6 +125,7 @@ class MegatronTrainer(BaseMegatronTrainer):
         labels = data.get('labels')
         if self.args.task_type == 'seq_cls':
             data.pop('labels', None)
+        self.call_event('on_model_inputs', inputs=data, labels=labels, phase='pre_model')
         output_tensor = model(**data)
         packed_seq_params = data.get('packed_seq_params')
         if self.args.task_type == 'seq_cls':

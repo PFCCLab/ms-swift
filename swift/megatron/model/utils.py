@@ -1,8 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from dataclasses import fields
-from mcore_bridge import ModelConfig
+
+from mcore_bridge import ModelConfig, hf_to_mcore_config
 from mcore_bridge import get_mcore_model as _get_mcore_model
-from mcore_bridge import hf_to_mcore_config
 from transformers.utils import is_torch_npu_available
 
 from swift.utils import get_logger
@@ -80,8 +80,37 @@ def get_mcore_model_config(args, hf_config):
     return config
 
 
+def _get_transformer_engine_module_classes(models):
+    classes = []
+    for model in models:
+        for module in model.modules():
+            module_path = module.__class__.__module__
+            if module_path.startswith(('transformer_engine', 'megatron.core.extensions.transformer_engine')):
+                classes.append(f'{module_path}.{module.__class__.__name__}')
+    return sorted(classes)
+
+
+def _audit_accuracy_compatible_model(args, config, models):
+    te_modules = _get_transformer_engine_module_classes(models)
+    te_module_classes = sorted(set(te_modules))
+    args.repro_transformer_impl = config.transformer_impl
+    args.repro_transformer_engine_module_count = len(te_modules)
+    args.repro_transformer_engine_module_classes = te_module_classes
+    if not args.use_accuracy_compatible:
+        return
+    if config.transformer_impl != 'local':
+        raise RuntimeError(
+            f'use_accuracy_compatible requires transformer_impl="local", got {config.transformer_impl!r}')
+    if te_module_classes:
+        raise RuntimeError(
+            'use_accuracy_compatible forbids TransformerEngine modules, found: '
+            f'{te_module_classes}')
+    logger.info('Accuracy-compatible model audit passed: transformer_impl=local, TransformerEngine modules=0.')
+
+
 def get_mcore_model(args, hf_config):
     config = get_mcore_model_config(args, hf_config)
     models = _get_mcore_model(config)
+    _audit_accuracy_compatible_model(args, config, models)
 
     return models

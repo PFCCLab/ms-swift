@@ -21,6 +21,9 @@ class MegatronCallback:
     def on_step_begin(self):
         pass
 
+    def on_model_inputs(self, inputs, labels=None, phase=None):
+        pass
+
     def on_step_end(self):
         pass
 
