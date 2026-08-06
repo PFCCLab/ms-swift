@@ -39,6 +39,61 @@ logger = get_logger()
 mcore_017 = version.parse(megatron.core.__version__) >= version.parse('0.17.0rc0')
 
 
+def _alignment_no_te_checkpoint_compat_enabled() -> bool:
+    """Whether to load a TE-style checkpoint into explicit no-TE specs."""
+
+    return os.environ.get('SWIFT_MEGATRON_NO_TE', '').lower() in {'1', 'true', 'yes', 'on'}
+
+
+def _get_checkpoint_metadata_keys(checkpoint_dir: str) -> set[str]:
+    try:
+        from torch.distributed.checkpoint import FileSystemReader
+        reader = FileSystemReader(checkpoint_dir)
+        metadata = reader.read_metadata()
+        return set(metadata.state_dict_metadata.keys())
+    except Exception as e:
+        logger.warning(f'Unable to read dist-checkpoint metadata for no-TE compatibility mapping: {e!r}')
+        return set()
+
+
+def _patch_no_te_alignment_checkpoint_keys(state_dict_model, checkpoint_dir: str):
+    """Map no-TE standalone norm parameters to TE fused norm-linear keys.
+
+    Megatron-Core local/no-TE specs expose q/kv/post-attention norms as
+    standalone parameters, while TE specs save the same tensors as
+    ``*.layer_norm_weight`` inside fused Linear modules.  Dist checkpointing
+    separates the Python dict key from the checkpoint source key (``v.key``),
+    so we can load TE-saved tensors into no-TE parameters without changing
+    module names.
+    """
+
+    if not _alignment_no_te_checkpoint_compat_enabled():
+        return
+    checkpoint_keys = _get_checkpoint_metadata_keys(checkpoint_dir)
+    if not checkpoint_keys:
+        return
+
+    patched = []
+    for key, value in state_dict_model.items():
+        source_key = None
+        if key.endswith('.self_attention.q_layernorm.weight'):
+            source_key = key.replace('.self_attention.q_layernorm.weight',
+                                     '.self_attention.linear_q_up_proj.layer_norm_weight')
+        elif key.endswith('.self_attention.kv_layernorm.weight'):
+            source_key = key.replace('.self_attention.kv_layernorm.weight',
+                                     '.self_attention.linear_kv_up_proj.layer_norm_weight')
+        elif key.endswith('.pre_mlp_layernorm.weight'):
+            source_key = key.replace('.pre_mlp_layernorm.weight', '.mlp.linear_fc1.layer_norm_weight')
+
+        if source_key and source_key in checkpoint_keys and hasattr(value, 'key'):
+            value.key = source_key
+            patched.append((key, source_key))
+
+    if patched:
+        logger.info('Applied no-TE alignment checkpoint key remap: %s',
+                    ', '.join(f'{target}<-{source}' for target, source in patched))
+
+
 @contextmanager
 def _patch_megatron_timeout(distributed_timeout_minutes):
     origin_create_group = parallel_state.create_group
@@ -451,6 +506,7 @@ def load_mcore_checkpoint(args,
     _filter_adapter_state_dict(sharded_state_dict, peft_format, adapter_name=adapter_name)
     model_keys = [k for k in sharded_state_dict.keys() if k.startswith('model')]  # compat vpp
     for k in model_keys:
+        _patch_no_te_alignment_checkpoint_keys(sharded_state_dict[k], checkpoint_dir)
         patch_merge_fn(sharded_state_dict[k])
     if mcore_017:
         load_strategy = TorchDistLoadShardedStrategy()
