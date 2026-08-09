@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from copy import copy, deepcopy
 from packaging import version
 from tqdm import tqdm
+from typing import Optional
 from transformers.modeling_utils import custom_object_save
 from transformers.utils import is_torch_npu_available
 from transformers.utils.versions import require_version
@@ -89,9 +90,28 @@ def _patch_validate_non_overlapping_shards_metadata():
     api2.validate_non_overlapping_shards_metadata = validate_non_overlapping_shards_metadata
 
     def _validate_global_plan(*args, **kwargs):
-        return True
+        # torch returns a list of error messages here; empty list means "no error".
+        return []
 
     default_planner._validate_global_plan = _validate_global_plan
+
+
+def _patch_transformers_output_recorder():
+    # transformers>=5 removed `OutputRecorder` and ignores `_can_record_outputs`, but remote code
+    # (e.g. MiniMax-M2 modeling_minimax_m2.py) still imports it. Provide a no-op placeholder.
+    from dataclasses import dataclass
+    from transformers.utils import generic
+
+    if hasattr(generic, 'OutputRecorder'):
+        return
+
+    @dataclass
+    class OutputRecorder:
+        target_class: type
+        index: Optional[int] = None
+        layer_name: Optional[str] = None
+
+    generic.OutputRecorder = OutputRecorder
 
 
 def _patch_unified_memory():
@@ -299,6 +319,7 @@ def init_megatron_env():
     os.environ.pop('VLLM_USE_MODELSCOPE', None)
     logging_level = logging.root.level
     _patch_unified_memory()
+    _patch_transformers_output_recorder()
     _patch_mcore_bridge()
     _patch__batched_p2p_ops()
     logging.root.setLevel(logging_level)  # revert logger level
