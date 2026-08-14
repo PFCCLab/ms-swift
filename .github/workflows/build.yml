@@ -31,9 +31,12 @@ jobs:
           source utils.sh
           determine_gpu_runner ${runner_name}
       - name: Checkout Code
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
+        run: |
+          source $work_dir/../../../proxy
+          git clone https://github.com/PFCCLab/ms-swift.git
+          cd ms-swift
+          git checkout "$BRANCH"
+          git log --pretty=oneline -5
       - name: Determine Image Name
         run: |
           echo "IMAGE_NAME=ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddle:cuda130-dev" >> "$GITHUB_ENV"
@@ -65,7 +68,7 @@ jobs:
           ldconfig
           pip config set global.cache-dir "/home/.cache/pip"
           set -e
-          cd /workspace && git config --global --add safe.directory $PWD
+          cd /workspace/ms-swift && git config --global --add safe.directory $PWD
           source $work_dir/../../../proxy
           bash scripts/dependence/build.sh
           '
