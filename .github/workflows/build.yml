@@ -32,6 +32,7 @@ jobs:
           determine_gpu_runner ${runner_name}
       - name: Checkout Code
         run: |
+          rm -rf ms-swift
           git clone https://github.com/PFCCLab/ms-swift.git
           cd ms-swift
           git log --pretty=oneline -5
