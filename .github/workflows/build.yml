@@ -34,7 +34,6 @@ jobs:
         run: |
           git clone https://github.com/PFCCLab/ms-swift.git
           cd ms-swift
-          git checkout "$BRANCH"
           git log --pretty=oneline -5
       - name: Determine Image Name
         run: |
