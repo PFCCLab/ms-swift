@@ -32,7 +32,6 @@ jobs:
           determine_gpu_runner ${runner_name}
       - name: Checkout Code
         run: |
-          source $work_dir/../../../proxy
           git clone https://github.com/PFCCLab/ms-swift.git
           cd ms-swift
           git checkout "$BRANCH"
@@ -69,7 +68,6 @@ jobs:
           pip config set global.cache-dir "/home/.cache/pip"
           set -e
           cd /workspace/ms-swift && git config --global --add safe.directory $PWD
-          source $work_dir/../../../proxy
           bash scripts/dependence/build.sh
           '
 
