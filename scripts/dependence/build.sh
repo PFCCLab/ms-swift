@@ -15,7 +15,7 @@
 # limitations under the License.
 
 set -e
-export swift_dir=/workspace
+export swift_dir=/workspace/ms-swift
 mkdir -p /workspace/build_logs
 export log_path=/workspace/build_logs
 mkdir -p /workspace/upload
@@ -65,7 +65,7 @@ echo -e "\033[32m ---- make ms-swift.tar.gz  \033[0m"
 if [ -n "$BRANCH" ] && [ "$BRANCH" = "main" ]; then
     echo "Checkout branch $BRANCH"
     cd /workspace
-    tar --exclude=./upload --exclude=./build_logs --exclude=./ms-swift.tar.gz -zcf ms-swift.tar.gz .
+    tar --exclude=./ms-swift/upload --exclude=./ms-swift/build_logs --exclude=./ms-swift/ms-swift.tar.gz -zcf ms-swift.tar.gz ./ms-swift
     mv ms-swift.tar.gz ${upload_path}/
 else
     echo "No BRANCH specified, skip checkout"
