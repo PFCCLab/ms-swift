@@ -35,6 +35,8 @@ jobs:
           rm -rf ms-swift
           git clone https://github.com/PFCCLab/ms-swift.git
           cd ms-swift
+          git fetch origin pull/${{ github.event.pull_request.number }}/head:pr-${{ github.event.pull_request.number }}
+          git checkout pr-${{ github.event.pull_request.number }}
           git log --pretty=oneline -5
       - name: Determine Image Name
         run: |
