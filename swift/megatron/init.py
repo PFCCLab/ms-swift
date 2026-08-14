@@ -197,6 +197,7 @@ def _patch_mcore_bridge_disable_te():
         def _post_init(self, *args, **kwargs):
             _origin_post_init(self, *args, **kwargs)
             self.persist_layer_norm = False
+            self.transformer_impl = 'local'
 
         _post_init._align_no_persist_ln = True
         McbModelConfig.__post_init__ = _post_init
@@ -221,7 +222,25 @@ def _patch_mcore_bridge_disable_te():
         return hf_state_dict
 
     McbGPTBridge._set_layer_attn = _set_layer_attn
-    logger.info('mcore_bridge patched for TE-off alignment (local spec, persist_layer_norm=False, input_layernorm map)')
+
+    # Qwen3.5 with USE_MCORE_GDN uses a bridge mixin that overrides GPTBridge's
+    # method, so patch its standalone input-norm mapping explicitly as well.
+    from mcore_bridge.model.gpts.qwen3_next_gdn import Qwen3NextGDNBridgeMixin
+
+    def _set_gdn_layer_attn(self, mg_layer, hf_state_dict, layer_idx, to_mcore):
+        mg_attn = None if mg_layer is None else mg_layer.self_attention
+        is_linear_attention = self.config.linear_attention_freq[layer_idx]
+        if is_linear_attention:
+            hf_state_dict.update(
+                self._set_linear_attn_state(mg_attn, hf_state_dict, 'linear_attn.', layer_idx, to_mcore))
+        else:
+            hf_state_dict.update(self._set_attn_state(mg_attn, hf_state_dict, 'self_attn.', layer_idx, to_mcore))
+        self._set_state_dict(mg_layer, 'input_layernorm.weight', hf_state_dict, self.hf_input_layernorm_key, to_mcore)
+        return hf_state_dict
+
+    Qwen3NextGDNBridgeMixin._set_layer_attn = _set_gdn_layer_attn
+    logger.info('mcore_bridge patched for TE-off alignment '
+                '(transformer_impl=local, persist_layer_norm=False, standalone input_layernorm map)')
 
 
 def _patch_mcore_bridge():

@@ -87,6 +87,13 @@ def initialize_megatron(args):
     # Pytorch distributed.
     _initialize_mpu(args)
 
+    if getattr(args, 'deterministic_mode', False):
+        # This must be enabled in every worker before model construction. ModelConfig's
+        # deterministic_mode selects deterministic MCore branches; the global guard also
+        # rejects/redirects nondeterministic PyTorch CUDA kernels (for example scatter/index add).
+        torch.use_deterministic_algorithms(True)
+        logger.info('Enabled torch deterministic algorithms for all Megatron workers.')
+
     # Random seeds for reproducibility.
     logger.info(f'Setting random seeds to {args.seed}.')
     set_random_seed(args.seed, args.data_parallel_random_init, args.te_rng_tracker)

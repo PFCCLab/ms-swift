@@ -508,6 +508,10 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     # Exported to the `USE_ACCURACY_COMPATIBLE` env var in __post_init__ so both ms-swift and
     # Megatron-LM core (incl. standalone/autograd functions without config access) can read it.
     use_accuracy_compatible: bool = False
+    # Also forward this flag into mcore ModelConfig. Unlike accuracy-compatible (which selects
+    # matching implementations), deterministic_mode enables PyTorch's global deterministic
+    # algorithm guard during Megatron initialization.
+    deterministic_mode: bool = False
     main_grads_dtype: Literal['fp32', 'bf16'] = 'fp32'
     main_params_dtype: Literal['fp32', 'fp16'] = 'fp32'
     exp_avg_dtype: Literal['fp32', 'fp16', 'bf16', 'fp8'] = 'fp32'
