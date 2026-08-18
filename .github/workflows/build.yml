@@ -30,12 +30,6 @@ jobs:
           wget -q https://xly-devops.bj.bcebos.com/utils.sh
           source utils.sh
           determine_gpu_runner ${runner_name}
-      - name: Checkout Code
-        run: |
-          rm -rf * .[^.]*
-          git clone https://github.com/PFCCLab/ms-swift.git
-          cd ms-swift
-          git log --pretty=oneline -5
       - name: Determine Image Name
         run: |
           echo "IMAGE_NAME=ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddle:cuda130-dev" >> "$GITHUB_ENV"
@@ -60,7 +54,15 @@ jobs:
             -e FLAGS_dynamic_static_unified_comm \
             -e python_version \
             -w /workspace --privileged $IMAGE_NAME
-
+      - name: Checkout Code
+        run: |
+          docker exec -t $container_name /bin/bash -c '
+            rm -rf * .[^.]*
+            source $work_dir/../../../proxy
+            git clone https://github.com/PFCCLab/ms-swift.git
+            cd ms-swift
+            git log --pretty=oneline -10
+          '
       - name: Build Whl
         run: |
           docker exec -t $container_name /bin/bash -c '
@@ -70,7 +72,6 @@ jobs:
           cd /workspace/ms-swift && git config --global --add safe.directory $PWD
           bash scripts/dependence/build.sh
           '
-
       - name: Upload Products
         env:
           home_path: ${{ github.workspace }}/..
@@ -103,7 +104,6 @@ jobs:
             echo "ms-swift.tar.gz not found, skip upload"
           fi
           '
-
       - name: Terminate And Delete the Container
         if: always()
         run: |
