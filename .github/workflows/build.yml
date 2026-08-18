@@ -77,8 +77,7 @@ jobs:
           '
       - name: Upload Products
         env:
-          home_path: ${{ github.workspace }}/..
-          bos_file: ${{ github.workspace }}/../bos_retry/BosClient.py
+          bos_file: ${{ github.workspace }}/bos_retry/BosClient.py
         if: always()
         run: |
           docker exec -t $container_name /bin/bash -c '
@@ -88,21 +87,21 @@ jobs:
           export AK=paddle
           export SK=paddle
           if [ ! -f "${{ env.bos_file }}" ]; then
-            wget -q --no-proxy -O ${{ env.home_path }}/bos_retry.tar.gz https://xly-devops.bj.bcebos.com/home/bos_retry.tar.gz --no-check-certificate
-            mkdir ${{ env.home_path }}/bos_retry
-            tar xf ${{ env.home_path }}/bos_retry.tar.gz -C ${{ env.home_path }}/bos_retry
+            wget -q --no-proxy -O /workspace/bos_retry.tar.gz https://xly-devops.bj.bcebos.com/home/bos_retry.tar.gz --no-check-certificate
+            mkdir /workspace/bos_retry
+            tar xf /workspace/bos_retry.tar.gz -C /workspace/bos_retry
           fi
           cd /workspace/upload
           for FILE in /workspace/upload/*.whl; do
             file=$(basename "$FILE")
-            python ${{ env.bos_file }} $file paddle-qa/paddlefleet/whl
-            echo "$file: https://paddle-qa.bj.bcebos.com/paddlefleet/whl/$file"
+            python ${{ env.bos_file }} $file paddle-github-action/whl
+            echo "$file: https://paddle-github-action.bj.bcebos.com/whl/$file"
           done
           TAR_FILE=/workspace/upload/ms-swift.tar.gz
           if [ -e "$TAR_FILE" ]; then
             file=$(basename "$TAR_FILE")
-            python ${{ env.bos_file }} $file paddle-qa/paddlefleet/whl
-            echo "$file: https://paddle-qa.bj.bcebos.com/paddlefleet/whl/$file"
+            python ${{ env.bos_file }} $file paddle-github-action/whl
+            echo "$file: https://paddle-github-action.bj.bcebos.com/paddlefleet/whl/$file"
           else
             echo "ms-swift.tar.gz not found, skip upload"
           fi
