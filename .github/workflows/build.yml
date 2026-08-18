@@ -61,6 +61,9 @@ jobs:
             source $work_dir/../../../proxy
             git clone https://github.com/PFCCLab/ms-swift.git
             cd ms-swift
+            # for test
+            git fetch origin pull/9/head:pr-9
+            git checkout pr-9
             git log --pretty=oneline -10
           '
       - name: Build Whl

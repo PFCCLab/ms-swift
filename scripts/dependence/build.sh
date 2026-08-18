@@ -38,9 +38,6 @@ swift_tar (){
 
 swift_build (){
     cd $swift_dir
-    # for test
-    git fetch origin pull/9/head:pr-9
-    git checkout pr-9
     rm -rf build/
     rm -rf dist/
     rm -rf ms_swift.egg-info/
