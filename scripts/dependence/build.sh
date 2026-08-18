@@ -24,9 +24,23 @@ upload_path=/workspace/upload
 python -m pip config --user set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
 python -m pip config --user set global.trusted-host pypi.tuna.tsinghua.edu.cn
 
+swift_tar (){
+    cd /workspace
+    # ms-swift.tar only include the main branch
+    if [ -n "$BRANCH" ] && [ "$BRANCH" = "main" ]; then
+        echo "Checkout branch $BRANCH"
+        tar -zcf ms-swift.tar.gz ms-swift/
+        mv ms-swift.tar.gz ${upload_path}/
+    else
+        echo "No BRANCH specified, skip checkout"
+    fi
+}
+
 swift_build (){
-    echo -e "\033[35m ---- build latest ms-swift  \033[0m"
     cd $swift_dir
+    # for test
+    git fetch origin pull/9/head:pr-9
+    git checkout pr-9
     rm -rf build/
     rm -rf dist/
     rm -rf ms_swift.egg-info/
@@ -57,16 +71,8 @@ swift_build (){
 
 # main
 cd ${swift_dir}
+echo -e "\033[32m ---- make ms-swift.tar.gz  \033[0m"
+swift_tar
 echo -e "\033[32m ---- build ms-swift whl  \033[0m"
 swift_build
 
-echo -e "\033[32m ---- make ms-swift.tar.gz  \033[0m"
-# ms-swift.tar only include the main branch
-if [ -n "$BRANCH" ] && [ "$BRANCH" = "main" ]; then
-    echo "Checkout branch $BRANCH"
-    cd /workspace
-    tar --exclude=./ms-swift/upload --exclude=./ms-swift/build_logs --exclude=./ms-swift/ms-swift.tar.gz -zcf ms-swift.tar.gz ./ms-swift
-    mv ms-swift.tar.gz ${upload_path}/
-else
-    echo "No BRANCH specified, skip checkout"
-fi
