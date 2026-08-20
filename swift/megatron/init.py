@@ -10,10 +10,10 @@ from contextlib import contextmanager
 from copy import copy, deepcopy
 from packaging import version
 from tqdm import tqdm
-from typing import Optional
 from transformers.modeling_utils import custom_object_save
 from transformers.utils import is_torch_npu_available
 from transformers.utils.versions import require_version
+from typing import Optional
 
 from swift.model import get_model_processor, save_checkpoint
 from swift.utils import (HfConfigFactory, disable_safe_ddp_context_use_barrier, get_logger, get_modules_to_not_convert,
@@ -178,6 +178,7 @@ def _patch_mcore_bridge_disable_te():
     import mcore_bridge.model.register as mcb_register
 
     def _force_local_spec(orig):
+
         def wrapper(*args, **kwargs):
             kwargs['use_transformer_engine'] = False
             return orig(*args, **kwargs)

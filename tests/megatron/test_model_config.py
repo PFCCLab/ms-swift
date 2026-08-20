@@ -1,7 +1,6 @@
-from types import SimpleNamespace
-
 import torch
 from transformers import PretrainedConfig
+from types import SimpleNamespace
 
 from swift.megatron.model import utils
 
@@ -33,8 +32,9 @@ def _make_args(mtp_num_layers=None):
 
 def _patch_model_config(monkeypatch):
     monkeypatch.setattr(utils, 'ModelConfig', _ModelConfigStub)
-    monkeypatch.setattr(
-        utils, 'fields', lambda _: [SimpleNamespace(name='mtp_num_layers'), SimpleNamespace(name='num_moe_experts')])
+    monkeypatch.setattr(utils, 'fields',
+                        lambda _: [SimpleNamespace(name='mtp_num_layers'),
+                                   SimpleNamespace(name='num_moe_experts')])
 
 
 def test_get_mcore_model_config_reads_mtp_num_layers_from_hf(monkeypatch):
