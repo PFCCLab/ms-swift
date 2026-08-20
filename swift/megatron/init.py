@@ -3,12 +3,14 @@ import concurrent.futures
 import importlib.metadata
 import logging
 import os
+import sys
 import torch
 import torch.distributed as dist
 from contextlib import contextmanager
 from copy import copy, deepcopy
 from packaging import version
 from tqdm import tqdm
+from typing import Optional
 from transformers.modeling_utils import custom_object_save
 from transformers.utils import is_torch_npu_available
 from transformers.utils.versions import require_version
@@ -88,9 +90,28 @@ def _patch_validate_non_overlapping_shards_metadata():
     api2.validate_non_overlapping_shards_metadata = validate_non_overlapping_shards_metadata
 
     def _validate_global_plan(*args, **kwargs):
-        return True
+        # torch returns a list of error messages here; empty list means "no error".
+        return []
 
     default_planner._validate_global_plan = _validate_global_plan
+
+
+def _patch_transformers_output_recorder():
+    # transformers>=5 removed `OutputRecorder` and ignores `_can_record_outputs`, but remote code
+    # (e.g. MiniMax-M2 modeling_minimax_m2.py) still imports it. Provide a no-op placeholder.
+    from dataclasses import dataclass
+    from transformers.utils import generic
+
+    if hasattr(generic, 'OutputRecorder'):
+        return
+
+    @dataclass
+    class OutputRecorder:
+        target_class: type
+        index: Optional[int] = None
+        layer_name: Optional[str] = None
+
+    generic.OutputRecorder = OutputRecorder
 
 
 def _patch_unified_memory():
@@ -116,12 +137,101 @@ def _patch_unified_memory():
         cpp_extension.load_inline = load_inline
 
 
+def _use_accuracy_compatible_enabled():
+    """Whether ``use_accuracy_compatible`` is on, resolved at *import* time.
+
+    ``_patch_mcore_bridge`` runs while ``swift.megatron`` is being imported, which is
+    before ``MegatronArguments.__post_init__`` sets the ``USE_ACCURACY_COMPATIBLE`` env
+    var. But the flag is already present in ``sys.argv`` at that point (the yaml
+    ``use_accuracy_compatible: true`` is expanded by ``parse_yaml_args`` into
+    ``--use_accuracy_compatible True`` and handed to the child process), so read it
+    from argv here. Fall back to the env var for cases where it is set up front.
+    """
+    argv = sys.argv
+    for i, arg in enumerate(argv):
+        if arg == '--use_accuracy_compatible':
+            if i + 1 < len(argv):
+                return str(argv[i + 1]).strip().lower() in ('1', 'true', 'yes')
+            return True  # bare flag
+        if arg.startswith('--use_accuracy_compatible='):
+            return arg.split('=', 1)[1].strip().lower() in ('1', 'true', 'yes')
+    return os.environ.get('USE_ACCURACY_COMPATIBLE', '0') == '1'
+
+
+def _patch_mcore_bridge_disable_te():
+    """Alignment: disable TransformerEngine at the layer-spec level (ex-ms-swift 175dd87).
+
+    These three behaviors used to live directly in ms-swift
+    ``model/{register,gpt_bridge,model_config}.py`` (commit 175dd87 "disabled TE").
+    After the model/bridge/config layer was extracted into the ``mcore_bridge`` pip
+    package they can no longer be committed as ms-swift source edits, and editing
+    site-packages is not reproducible. We therefore re-apply them here as runtime
+    monkeypatches on the imported mcore_bridge modules, so the change stays in
+    versioned ms-swift source and survives a mcore_bridge reinstall.
+
+    TE stays importable (``HAVE_TE`` is left True); we only avoid *building* TE
+    layers by forcing the local layer spec. The router-gating GEMM alignment is
+    handled separately by ``use_accuracy_compatible``.
+    """
+    # 1) force the local (non-TE) layer spec: use_transformer_engine=False for both
+    #    the decoder block spec and the MTP block spec.
+    import mcore_bridge.model.register as mcb_register
+
+    def _force_local_spec(orig):
+        def wrapper(*args, **kwargs):
+            kwargs['use_transformer_engine'] = False
+            return orig(*args, **kwargs)
+
+        return wrapper
+
+    mcb_register.get_gpt_decoder_block_spec = _force_local_spec(mcb_register.get_gpt_decoder_block_spec)
+    mcb_register.get_gpt_mtp_block_spec = _force_local_spec(mcb_register.get_gpt_mtp_block_spec)
+
+    # 2) persist_layer_norm=False on the model config (dataclass default is baked into
+    #    __init__, so flip it on the instance via __post_init__).
+    from mcore_bridge.config.model_config import ModelConfig as McbModelConfig
+
+    if not getattr(McbModelConfig.__post_init__, '_align_no_persist_ln', False):
+        _origin_post_init = McbModelConfig.__post_init__
+
+        def _post_init(self, *args, **kwargs):
+            _origin_post_init(self, *args, **kwargs)
+            self.persist_layer_norm = False
+
+        _post_init._align_no_persist_ln = True
+        McbModelConfig.__post_init__ = _post_init
+
+    # 3) local-spec input-layernorm key mapping: with the local spec the input
+    #    layernorm is a standalone `input_layernorm` module, not folded into
+    #    `linear_qkv.layer_norm_weight`.
+    from mcore_bridge.bridge.gpt_bridge import GPTBridge as McbGPTBridge
+
+    def _set_layer_attn(self, mg_layer, hf_state_dict, layer_idx, to_mcore):
+        mg_attn = None if mg_layer is None else mg_layer.self_attention
+        if self.config.multi_latent_attention:
+            hf_state_dict.update(
+                self._set_mla_attn_state(mg_attn, hf_state_dict, f'{self.hf_attn_prefix}.', layer_idx, to_mcore))
+            self._set_state_dict(mg_layer, 'input_layernorm.weight', hf_state_dict, self.hf_input_layernorm_key,
+                                 to_mcore)
+        else:
+            hf_state_dict.update(
+                self._set_attn_state(mg_attn, hf_state_dict, f'{self.hf_attn_prefix}.', layer_idx, to_mcore))
+            self._set_state_dict(mg_layer, 'input_layernorm.weight', hf_state_dict, self.hf_input_layernorm_key,
+                                 to_mcore)
+        return hf_state_dict
+
+    McbGPTBridge._set_layer_attn = _set_layer_attn
+    logger.info('mcore_bridge patched for TE-off alignment (local spec, persist_layer_norm=False, input_layernorm map)')
+
+
 def _patch_mcore_bridge():
     require_version('mcore-bridge>=1.4.0', 'please install mcore-bridge via `pip install mcore-bridge -U`')
     import mcore_bridge
     from mcore_bridge import GPTBridge
     from mcore_bridge.model.register import ModelLoader
     logger.info(f'mcore_bridge.__version__: {mcore_bridge.__version__}')
+    if _use_accuracy_compatible_enabled():
+        _patch_mcore_bridge_disable_te()
     if not getattr(ModelLoader._replace_spec_dsa, '_swift_norm_accuracy_patch', False):
         origin_replace_spec_dsa = ModelLoader._replace_spec_dsa
 
@@ -224,6 +334,7 @@ def init_megatron_env():
     os.environ.pop('VLLM_USE_MODELSCOPE', None)
     logging_level = logging.root.level
     _patch_unified_memory()
+    _patch_transformers_output_recorder()
     _patch_mcore_bridge()
     _patch__batched_p2p_ops()
     logging.root.setLevel(logging_level)  # revert logger level

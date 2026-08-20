@@ -84,7 +84,16 @@ class TeacherModelArguments:
         metadata={
             'help':
             'URL of the teacher model server (e.g., http://localhost:8000). '
-            'When set, teacher logprobs are fetched via API instead of loading a local model.'
+            'When set, teacher logprobs are fetched via API instead of loading a local model. '
+            'Supports multi-teacher via JSON list of {url, tags}.'
+        })
+    teacher_tag_key: str = field(
+        default='dataset',
+        metadata={
+            'help':
+            'Column name in the dataset used for multi-teacher routing. '
+            'Samples are routed to teachers based on this field\'s value matching teacher "tags". '
+            'Default "dataset" (auto-injected when loading multiple datasets).'
         })
     offload_teacher_model: bool = False
 
@@ -391,6 +400,8 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
                 raise ValueError(f'Invalid advantage_estimator: {self.advantage_estimator}')
 
     def _check_teacher(self):
+        self._teacher_use_disable_adapter = False
+
         if self.rlhf_type not in ['grpo', 'gkd']:
             if self.teacher_model is not None or self.teacher_model_server is not None:
                 logger.warning(f'teacher_model / teacher_model_server is ignored for rlhf_type={self.rlhf_type!r} '
@@ -412,8 +423,14 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         if self.teacher_model is not None and self.teacher_model_server is not None:
             raise ValueError('setting both `teacher_model` and `teacher_model_server` is not supported.')
 
+        # Validate teacher_model_server: accept single URL or JSON multi-teacher config.
+        if self.teacher_model_server is not None:
+            from swift.rlhf_trainers.gkd_helpers import parse_teacher_model_server
+
+            # Parse early to fail fast on invalid JSON; result is re-parsed by the trainer.
+            parse_teacher_model_server(self.teacher_model_server)
+
         # Self-distillation: teacher_model == student model
-        self._teacher_use_disable_adapter = False
         if self.teacher_model is not None and self.teacher_model == self.model:
             if self.tuner_type == 'lora':
                 logger.info('LoRA + same teacher_model: using disable_adapter() for fixed teacher (no extra model).')

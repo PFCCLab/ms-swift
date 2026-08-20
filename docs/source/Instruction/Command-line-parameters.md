@@ -511,6 +511,7 @@ Vera使用`target_modules`、`target_regex`、`modules_to_save`三个参数，�
   - 注意：Qwen3-Next的packing请使用Megatron-SWIFT。Qwen3.5的transformers生态padding_free/packing支持请使用"ms-swift>=4.3.1"（或使用Megatron-SWIFT），具体参考[Qwen3.5最佳实践](../BestPractices/Qwen3_5-Best-Practice.md)。
 - packing_length: packing的长度。默认为None，设置为max_length。
 - packing_num_proc: packing的进程数，默认为1。需要注意的是，不同的`packing_num_proc`，最终形成的packed数据集是不同的。（该参数在流式packing时不生效）。通常不需要修改该值，packing速度远快于tokenize速度。
+- packing_strategy: packing 算法，可选为'binpack'和'sequential'，默认为'binpack'。'binpack'使用 best-fit-decreasing 装箱（会按长度重排样本）；'sequential'使用保序的贪心装箱（next-fit：仅维护一个开放 pack，放不下即 flush），按输入顺序逐条装箱，使样本顺序与每个 pack 的边界跟随顺序采样器（建议配合 packing_num_proc=1 以保证全局顺序）。
 - lazy_tokenize: 是否使用lazy_tokenize。若该参数设置为False，则在训练之前对所有的数据集样本进行tokenize（多模态模型则包括从磁盘中读取图片）。该参数默认为None，在LLM训练中默认为False，而MLLM训练默认为True，节约内存。
   - 注意：若你要进行图像的数据增强，你需要将lazy_tokenize（或streaming）设置为True，并修改Template类中的encode方法。
 - use_logits_to_keep: 通过在`forward`中根据labels传入logits_to_keep，减少无效logits的计算与存储，从而减少显存占用并加快训练速度。默认为None，进行自动选择。
@@ -575,7 +576,7 @@ RLHF参数继承于[训练参数](#训练参数)。
 #### GKD参数
 - lmbda: 默认为0.5。该参数在GKD中使用。控制学生数据比例的 lambda 参数（即策略内学生生成输出所占的比例）。若lmbda为0，则不使用学生生成数据。
 - sft_alpha: 默认为0。控制GKD中加入sft_loss的权重。最后的loss为`gkd_loss + sft_alpha * sft_loss`。
-- gkd_logits_topk: 使用 Top-K logits 计算 KL 散度，默认为 None（即使用完整词表计算）。设置该参数可有效降低训练显存峰值；当配置 teacher_model_server 时，此参数为必填项。详见[蒸馏文档](./Distillation.md#top-k-蒸馏省显存)。
+- gkd_logits_topk: 使用 Top-K logits 计算 KL 散度，默认为 None（即使用完整词表计算）。设置该参数可有效降低训练显存峰值；当配置 `teacher_model_server` 时，此参数为必填项。详见[蒸馏文档](./Distillation.md#31-gkd散度作为直接损失)。
 - truncation_strategy: 用于处理输入长度超过 max_length 的样本，支持 delete 和 left 两种策略，分别表示删除该样本和从左侧裁剪。默认值为 left。若使用 delete 策略，被删除的超长样本或编码失败的样本将在原数据集中通过重采样进行替换。
 - log_completions: 是否记录训练中的模型生成内容，搭配 `--report_to wandb/swanlab` 使用。默认为False。
   - 提示：若没有设置`--report_to wandb/swanlab`，则会在checkpoint中创建`completions.jsonl`来存储生成内容。
@@ -592,7 +593,8 @@ reward模型参数将在PPO、GRPO中使用；teacher模型参数在GKD与GRPO�
 - teacher_adapters: 默认为`[]`。
 - teacher_model_type: 默认为None。
 - teacher_model_revision: 默认为None。
-- teacher_model_server: 教师模型服务地址, 如：`http://localhost:8000`, 使用`swift deploy`部署的服务端计算logps。
+- teacher_model_server: 教师模型服务地址，通过 `swift deploy` 部署后用于获取 logprobs。支持单 teacher URL（如 `http://localhost:8000`）或多 teacher JSON（如 `'[{"url":"http://t1:8000","tags":["data/math.jsonl"]},{"url":"http://t2:8001","tags":["data/code.jsonl"]}]'`）。`tags` 与数据集或样本标识的对应关系见[蒸馏文档](./Distillation.md#multi-teacher多教师路由)。
+- teacher_tag_key: 多 teacher 路由时，样本用于匹配 teacher `tags` 的字段名，默认为 `"dataset"`。多数据集时按 `--dataset` 各项匹配；也可在数据中自定义列（如 `teacher_tag`）并设为 `--teacher_tag_key teacher_tag`。
 - teacher_deepspeed: 同 deepspeed 参数，控制 teacher model 的 deepspeed 配置，默认使用训练模型的 deepspeed 配置。
 - offload_teacher_model: 卸载教师模型以节约显存，在采样/计算logps时加载，仅在设置teacher_model时生效默认为False。
 

@@ -40,6 +40,7 @@
 - 🔥optimizer_cpu_offload: Offloads optimizer states to the CPU. For example, set: `--use_precision_aware_optimizer true --optimizer_cpu_offload true --optimizer_offload_fraction 0.7`. Defaults to `False`.
   - This parameter can significantly reduce GPU memory usage (at the cost of increased CPU memory consumption). When the `global_batch_size` is large, its impact on training speed is minimal.
 - 🔥optimizer_offload_fraction: The fraction of the optimizer state to offload to CPU. Default is `1.0`.
+- optimizer_cuda_graph: Whether to enable CUDA graph for the optimizer step, forwarded to Megatron's `--optimizer-cuda-graph`. Default is `False`. This parameter requires "megatron-core>=0.17".
 - use_precision_aware_optimizer: Use the precision-aware optimizer in TransformerEngine, which allows setting the main parameters and optimizer states to lower precision, such as fp16 and fp8.
 - main_grads_dtype: The dtype of main gradients when use_precision_aware_optimizer is enabled. Options are 'fp32' and 'bf16'. Default is 'fp32'.
 - main_params_dtype: The dtype of main parameters when use_precision_aware_optimizer is enabled. Options are 'fp32' and 'fp16'. Default is 'fp32'.
@@ -441,7 +442,8 @@ Used in GKD and GRPO.
 - teacher_model: Path or model ID of the teacher model. Required.
 - teacher_model_type: Teacher model type. Default is None, auto-detected.
 - teacher_model_revision: Teacher model version. Default is None.
-- teacher_model_server: Teacher model service URL, e.g. `http://localhost:8000`. Deploy via `swift deploy` for logprobs.
+- teacher_model_server: Teacher model service URL. Deploy via `swift deploy` for logprobs; mutually exclusive with `teacher_model`. Single URL or multi-teacher JSON (`'[{"url":"...","tags":["..."]}, ...]'`). See [distillation docs](../Instruction/Distillation.md#multi-teacher-routing).
+- teacher_tag_key: Column name for multi-teacher routing (match sample values to teacher `tags`). Default is `"dataset"`.
 - offload_teacher_model: Whether to offload teacher model to CPU to save GPU memory. Default is False.
 
 ## Export Parameters
