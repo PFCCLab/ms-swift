@@ -78,9 +78,9 @@ class MegatronTrainer(BaseMegatronTrainer):
             import hashlib as _hashlib
             _final = (loss[0].detach().float() / loss[1].detach().float().clamp(min=1)).contiguous()
             print(
-                f"\nfinal_loss: rank={torch.distributed.get_rank()} "
-                f"val={_final.item():.20f} "
-                f"md5={_hashlib.md5(_final.cpu().numpy().tobytes()).hexdigest()}",
+                f'\nfinal_loss: rank={torch.distributed.get_rank()} '
+                f'val={_final.item():.20f} '
+                f'md5={_hashlib.md5(_final.cpu().numpy().tobytes()).hexdigest()}',
                 flush=True)
 
         metrics = {'loss': reporting_loss}
