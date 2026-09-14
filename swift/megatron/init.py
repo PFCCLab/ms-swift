@@ -42,7 +42,6 @@ def _patch__batched_p2p_ops():
 def _patch_torch_FileSystemReader():
     from torch.distributed.checkpoint.filesystem import FileSystemReader
     from torch.futures import Future
-
     _origin_read_data = FileSystemReader.read_data
     _origin__slice_file = FileSystemReader._slice_file
     READER_MAX_WORKERS = int(os.environ.get('MCORE_READER_MAX_WORKERS', '16'))
@@ -92,11 +91,11 @@ def _patch_validate_non_overlapping_shards_metadata():
     def validate_non_overlapping_shards_metadata(*args, **kwargs):
         pass
 
-    api.validate_non_overlapping_shards_metadata = (validate_non_overlapping_shards_metadata)
-    api2.validate_non_overlapping_shards_metadata = (validate_non_overlapping_shards_metadata)
+    api.validate_non_overlapping_shards_metadata = validate_non_overlapping_shards_metadata
+    api2.validate_non_overlapping_shards_metadata = validate_non_overlapping_shards_metadata
 
     def _validate_global_plan(*args, **kwargs):
-        # torch returns a list of error messages here; empty list means 'no error'.
+        # torch returns a list of error messages here; empty list means "no error".
         return []
 
     default_planner._validate_global_plan = _validate_global_plan
@@ -125,7 +124,6 @@ def _patch_unified_memory():
         return
 
     from torch.utils import cpp_extension
-
     load_inline = cpp_extension.load_inline
 
     def _new_load_inline(*args, **kwargs):
@@ -185,7 +183,6 @@ def _patch_mcore_bridge_disable_te():
     import mcore_bridge.model.register as mcb_register
 
     def _force_local_spec(orig):
-
         def wrapper(*args, **kwargs):
             kwargs['use_transformer_engine'] = False
             return orig(*args, **kwargs)
@@ -201,7 +198,11 @@ def _patch_mcore_bridge_disable_te():
     # Torch DSA TE contaminated post_attn_norm. Force LocalSpecProvider instead.
     from megatron.core.models.gpt import experimental_attention_variant_module_specs as _eav
 
+    origin_backend_spec_provider = _eav._get_backend_spec_provider
+
     def _local_backend_spec_provider(config):
+        if not getattr(config, 'dsa_accuracy_compatible', False):
+            return origin_backend_spec_provider(config)
         from megatron.core.models.backends import LocalSpecProvider
         return LocalSpecProvider()
 
@@ -242,68 +243,75 @@ def _patch_mcore_bridge_disable_te():
 
     McbGPTBridge._set_layer_attn = _set_layer_attn
 
-    # 4) local-spec dense-MLP norm key mapping: with the local (non-TE) spec the
-    #    dense MLP is `ColumnParallelLinear` + separate `pre_mlp_layernorm`
-    #    (no fused `linear_fc1.layer_norm_weight`); route that key accordingly.
-    def _set_layer_mlp(self, mg_layer, hf_state_dict, layer_idx, to_mcore, is_mtp=False):
-        mg_mlp = None if mg_layer is None else mg_layer.mlp
-        is_moe = True if mg_mlp is not None and hasattr(mg_mlp, 'experts') else False
-        if not to_mcore:
-            is_moe = torch.tensor([is_moe], dtype=torch.bool, device='cuda')
-            if self.pp_size > 1:
-                dist.all_reduce(is_moe, group=self.pp_group)
-        if is_moe:
-            hf_state_dict.update(
-                self._set_moe_state(
-                    mg_mlp, hf_state_dict, f'{self.hf_mlp_prefix}.', layer_idx, to_mcore, is_mtp=is_mtp))
-            self._set_state_dict(mg_layer, 'pre_mlp_layernorm.weight', hf_state_dict,
-                                 self.hf_post_attention_layernorm_key, to_mcore)
-        else:
-            hf_state_dict.update(
-                self._set_mlp_state(mg_mlp, hf_state_dict, f'{self.hf_mlp_prefix}.', layer_idx, to_mcore))
-            mg_fc1 = None if mg_layer is None else getattr(getattr(mg_layer, 'mlp', None), 'linear_fc1', None)
-            fused_norm_weight = getattr(mg_fc1, 'layer_norm_weight', None)
-            if fused_norm_weight is None:
-                self._set_state_dict(mg_layer, 'pre_mlp_layernorm.weight', hf_state_dict,
-                                     self.hf_post_attention_layernorm_key, to_mcore)
-            else:
-                self._set_state_dict(mg_layer, 'mlp.linear_fc1.layer_norm_weight', hf_state_dict,
-                                     self.hf_post_attention_layernorm_key, to_mcore)
-        return hf_state_dict
+    # Dense local MLPs store their norm separately from linear_fc1. Keep the
+    # bridge's load/export logic, correcting only this TE-specific parameter key.
+    origin_set_state_dict = McbGPTBridge._set_state_dict
 
-    McbGPTBridge._set_layer_mlp = _set_layer_mlp
+    def _set_state_dict(self, mg_module, mg_key, hf_state_dict, hf_key, to_mcore, **kwargs):
+        if mg_key == 'mlp.linear_fc1.layer_norm_weight':
+            fc1 = getattr(getattr(mg_module, 'mlp', None), 'linear_fc1', None)
+            if getattr(fc1, 'layer_norm_weight', None) is None:
+                mg_key = 'pre_mlp_layernorm.weight'
+        return origin_set_state_dict(self, mg_module, mg_key, hf_state_dict, hf_key, to_mcore, **kwargs)
+
+    McbGPTBridge._set_state_dict = _set_state_dict
     logger.info(
         'mcore_bridge patched for TE-off alignment (local spec, persist_layer_norm=False, input_layernorm+mlp-norm map)'
     )
 
 
 def _patch_mcore_bridge_tp1_accuracy():
-    """Keep the TP1 accuracy graph free of bridge-only viewless nodes."""
+    """Apply the DSA TP1 graph choice only within the configured bridge instance."""
+    from contextvars import ContextVar
+    from functools import wraps
     from mcore_bridge.model.modules import mtp_layer, transformer_block
-    from megatron.core import parallel_state
 
-    def patch_module(module):
+    active = ContextVar('swift_dsa_tp1_accuracy', default=False)
+
+    def scoped(method):
+
+        @wraps(method)
+        def call(self, *args, **kwargs):
+            config = self.config
+            token = active.set(
+                getattr(config, 'dsa_accuracy_compatible', False) and config.tensor_model_parallel_size <= 1)
+            try:
+                return method(self, *args, **kwargs)
+            finally:
+                active.reset(token)
+
+        return call
+
+    def patch_module(module, cls, methods):
         original = module.make_viewless_tensor
         if getattr(original, '_swift_tp1_accuracy_patch', False):
             return
 
         def make_viewless_tensor(inp, requires_grad, keep_graph):
-            if (_use_accuracy_compatible_enabled() and parallel_state.get_tensor_model_parallel_world_size() <= 1):
+            if active.get():
                 return inp
             return original(inp=inp, requires_grad=requires_grad, keep_graph=keep_graph)
 
         make_viewless_tensor._swift_tp1_accuracy_patch = True
         module.make_viewless_tensor = make_viewless_tensor
+        if hasattr(module, 'gather_from_tensor_model_parallel_region'):
+            original_gather = module.gather_from_tensor_model_parallel_region
 
-    patch_module(mtp_layer)
-    patch_module(transformer_block)
+            def gather(input_, group=None):
+                if active.get() and (group is None or group.size() <= 1):
+                    return input_
+                return original_gather(input_, group=group)
+
+            module.gather_from_tensor_model_parallel_region = gather
+        for name in methods:
+            setattr(cls, name, scoped(getattr(cls, name)))
+
+    patch_module(mtp_layer, mtp_layer.MultiTokenPredictionLayer, ('_concat_embeddings', '_get_embeddings'))
+    patch_module(transformer_block, transformer_block.TransformerBlock, ('forward', ))
 
 
 def _patch_mcore_bridge():
-    require_version(
-        'mcore-bridge>=1.4.0',
-        'please install mcore-bridge via `pip install mcore-bridge -U`',
-    )
+    require_version('mcore-bridge>=1.4.0', 'please install mcore-bridge via `pip install mcore-bridge -U`')
     import mcore_bridge
     from mcore_bridge import GPTBridge
     from mcore_bridge.model.register import ModelLoader
@@ -327,7 +335,7 @@ def _patch_mcore_bridge():
                 'indexer',
                 None,
             )
-            if (_use_accuracy_compatible_enabled() and indexer is not None
+            if (getattr(self.config, 'norm_accuracy_compatible', False) and indexer is not None
                     and getattr(indexer, 'submodules', None) is not None):
                 indexer.submodules.k_norm = WrappedTorchNorm
 
@@ -344,13 +352,7 @@ def _patch_mcore_bridge():
         args=None,
         processor=None,
     ) -> None:
-        origin_save_weights(
-            self,
-            mg_models,
-            output_dir,
-            peft_format=peft_format,
-            max_shard_size=max_shard_size,
-        )
+        origin_save_weights(self, mg_models, output_dir, peft_format=peft_format, max_shard_size=max_shard_size)
         if processor is None or args is None:
             return
         hf_config = self.config.hf_config
@@ -381,8 +383,7 @@ def _patch_mcore_bridge():
                         freeze_vit=args.freeze_vit,
                         freeze_aligner=args.freeze_aligner,
                         include_embedding='all-embedding' in args.target_modules,
-                        exclude_router='all-router' not in args.target_modules,
-                    )
+                        exclude_router='all-router' not in args.target_modules)
                 else:
                     assert not isinstance(peft_config.target_modules, str), (
                         'target_regex is not currently supported for LoRA conversion. Please set `--merge_lora true`.')
@@ -401,9 +402,8 @@ def _patch_mcore_bridge():
                         llm_config.num_nextn_predict_layers = config.mtp_num_layers
                 HfConfigFactory.del_config_attr(hf_config, 'quantization_config')
                 expert_dtype = None
-                if (config.fp8 is not None and config.fp8_recipe == 'blockwise' and config.fp8_param):
+                if config.fp8 is not None and config.fp8_recipe == 'blockwise' and config.fp8_param:
                     from transformers.utils.quantization_config import FineGrainedFP8Config
-
                     modules_to_not_convert = get_modules_to_not_convert(self.hf_model)
                     if hasattr(self, '_fp8_skip_modules'):
                         modules_to_not_convert = (modules_to_not_convert or []) + list(self._fp8_skip_modules)
@@ -422,8 +422,7 @@ def _patch_mcore_bridge():
                     processor,
                     output_dir,
                     model_dirs=[args.model_dir],
-                    additional_saved_files=self.hf_model.model_meta.additional_saved_files,
-                )
+                    additional_saved_files=self.hf_model.model_meta.additional_saved_files)
             logger.info(f'Successfully saved `safetensors` model weights in `{output_dir}`.')
         dist.barrier()  # Ensure all weights are saved completely
 
@@ -448,5 +447,4 @@ def init_megatron_env():
         logger.warning('Patch validate_non_overlapping_shards_metadata failed.')
         pass
     import megatron.core
-
     logger.info(f'megatron.core.__version__: {megatron.core.__version__}')

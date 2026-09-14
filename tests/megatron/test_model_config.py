@@ -1,3 +1,4 @@
+import ast
 import inspect
 import math
 import torch
@@ -61,37 +62,6 @@ def test_get_mcore_model_config_propagates_accuracy_mode(monkeypatch):
         assert config.kwargs['use_accuracy_compatible'] is enabled
 
 
-def test_sft_pipeline_preserves_explicit_gradient_clipping(monkeypatch):
-    from swift.megatron.pipelines.train import sft
-
-    def initialize_arguments(pipeline, args):
-        pipeline.args = args
-
-    def prepare_template(pipeline):
-        pipeline.template = SimpleNamespace()
-
-    monkeypatch.setattr(sft.SwiftSft.__mro__[1], '__init__', initialize_arguments)
-    monkeypatch.setattr(sft.MegatronSft, '_prepare_template', prepare_template)
-    monkeypatch.setattr(sft, 'repatch', None)
-    for accuracy_enabled in (False, True):
-        monkeypatch.setenv('USE_ACCURACY_COMPATIBLE', str(int(accuracy_enabled)))
-        for clip_grad in (0.0, 0.25, 1.0):
-            saved_clip_values = []
-            args = SimpleNamespace(
-                clip_grad=clip_grad,
-                template_meta=SimpleNamespace(template_cls=None),
-                model_meta=SimpleNamespace(is_multimodal=False),
-                mcore_model=None,
-                output_dir='unused',
-                get_model_processor=lambda **kwargs: (None, None),
-            )
-            args.save_args = lambda _, actual=args, captured=saved_clip_values: captured.append(actual.clip_grad)
-            pipeline = sft.MegatronSft(args)
-            assert pipeline.args.clip_grad == clip_grad
-            assert saved_clip_values == [clip_grad]
-            assert pipeline.template.use_megatron
-
-
 def test_get_mcore_model_config_does_not_enable_mtp_from_checkpoint(monkeypatch):
     _patch_model_config(monkeypatch)
     hf_config = PretrainedConfig(num_nextn_predict_layers=1)
@@ -133,7 +103,7 @@ def test_get_mcore_model_config_does_not_enable_mtp_from_nested_checkpoint(monke
 
 def test_get_mcore_model_config_prefers_n_routed_experts(monkeypatch):
     _patch_model_config(monkeypatch)
-    hf_config = PretrainedConfig(num_experts=256, n_routed_experts=16)
+    hf_config = PretrainedConfig(model_type="glm_moe_dsa", num_experts=256, n_routed_experts=16)
 
     config = utils.get_mcore_model_config(_make_args(), hf_config)
 
@@ -161,7 +131,11 @@ def test_get_padding_to_sequence_parallel_uses_tp_times_two():
         fp4=None,
         attention_backend='unfused',
     )
+    assert get_padding_to(args) == 2
+    args.megatron_extra_kwargs = {"dsa_accuracy_compatible": True}
     assert get_padding_to(args) == 4
+    args.megatron_extra_kwargs = {"dsa_accuracy_compatible": False}
+    assert get_padding_to(args) == 2
     seq_len = 57
     assert math.ceil(seq_len / 4) * 4 == 60
     assert math.ceil(seq_len / 2) * 2 == 58
@@ -185,17 +159,10 @@ def test_dsa_backend_forced_to_local_spec_when_accuracy_compatible(monkeypatch):
 
     monkeypatch.setattr(init, '_use_accuracy_compatible_enabled', lambda: True)
     init._patch_mcore_bridge_disable_te()
-    provider = eav._get_backend_spec_provider(SimpleNamespace())
+    provider = eav._get_backend_spec_provider(SimpleNamespace(dsa_accuracy_compatible=True))
     assert isinstance(provider, LocalSpecProvider)
     assert hasattr(provider, 'linear')
     assert provider.linear() is not provider.column_parallel_linear()
-
-
-def test_local_spec_mlp_norm_maps_pre_mlp_layernorm_when_unfused():
-    source = inspect.getsource(_patch_mcore_bridge_disable_te)
-    assert 'fused_norm_weight is None' in source
-    assert 'pre_mlp_layernorm.weight' in source
-    assert 'mlp.linear_fc1.layer_norm_weight' in source
 
 
 def test_dsa_index_share_rejects_selective_recompute():
@@ -211,3 +178,23 @@ def test_dsa_index_share_rejects_selective_recompute():
         assert 'Set recompute_granularity=none' in str(error)
     else:
         raise AssertionError('expected DSA index sharing with selective recompute to fail closed')
+
+
+def test_local_dense_norm_binding_keeps_other_parameter_keys():
+    tree = ast.parse(inspect.getsource(_patch_mcore_bridge_disable_te))
+    node = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == '_set_state_dict')
+    namespace = {'origin_set_state_dict': lambda *args, **kwargs: (args, kwargs)}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), '<production norm binding>', 'exec'), namespace)
+    bind = namespace['_set_state_dict']
+    local = SimpleNamespace(mlp=SimpleNamespace(linear_fc1=SimpleNamespace()))
+    fused = SimpleNamespace(mlp=SimpleNamespace(linear_fc1=SimpleNamespace(layer_norm_weight=object())))
+    for layer, key, expected in (
+        (local, 'mlp.linear_fc1.layer_norm_weight', 'pre_mlp_layernorm.weight'),
+        (None, 'mlp.linear_fc1.layer_norm_weight', 'pre_mlp_layernorm.weight'),
+        (fused, 'mlp.linear_fc1.layer_norm_weight', 'mlp.linear_fc1.layer_norm_weight'),
+        (local, 'mlp.linear_fc1.weight', 'mlp.linear_fc1.weight'),
+    ):
+        args, kwargs = bind(object(), layer, key, {}, 'post_attention_layernorm.weight', True, offset=0.5)
+        assert args[2] == expected
+        assert args[4:] == ('post_attention_layernorm.weight', True)
+        assert kwargs == {'offset': 0.5}

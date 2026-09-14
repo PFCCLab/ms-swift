@@ -669,7 +669,6 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
 
     # mtp
     mtp_num_layers: Optional[int] = None
-    num_nextn_predict_layers: Optional[int] = None
     mtp_loss_scaling_factor: float = 0.1
     mtp_decoder_input_detach: bool = False
     mtp_shared_weights: bool = False
@@ -800,8 +799,6 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
                 logger.warning(f'Failed to sync dummy template suffix for use_accuracy_compatible: {e}')
 
         self._check_mcore_bridge()
-        if self.mtp_num_layers is None and self.num_nextn_predict_layers is not None:
-            self.mtp_num_layers = self.num_nextn_predict_layers
 
         if self.recompute_granularity == 'none':
             self.recompute_granularity = None

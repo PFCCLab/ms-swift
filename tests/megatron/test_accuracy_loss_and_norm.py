@@ -100,7 +100,7 @@ class AccuracyLossAndNormTest(unittest.TestCase):
                 with patch.dict(sys.modules, {module.__name__: module}):
                     replace_spec(loader, spec)
                 self.assertEqual(calls, ['provider'])
-                self.assertIs(indexer.submodules.k_norm, native_norm if enabled else provider_norm)
+                self.assertIs(indexer.submodules.k_norm, native_norm if norm_accuracy else provider_norm)
                 expected_qkv = native_norm if norm_accuracy else provider_norm
                 self.assertIs(attention.submodules.q_layernorm, expected_qkv)
                 self.assertIs(attention.submodules.kv_layernorm, expected_qkv)

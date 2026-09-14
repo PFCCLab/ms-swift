@@ -212,10 +212,9 @@ def get_padding_to(args):
     padding_to = None
     if args.tensor_model_parallel_size > 1 and args.sequence_parallel:
         padding_to = args.tensor_model_parallel_size
-        # Sequence-parallel interleaves the sequence across TP ranks at 2x.
-        # Without this the collator pads to ceil(57/TP)*TP=58 while the
-        # PaddleFleet carrier and E-811 IEEE 1-100 are 60 (57 -> TP*SP=4).
-        padding_to = padding_to * 2
+        # Match the DSA reference carrier without changing other TP+SP models.
+        if (getattr(args, 'megatron_extra_kwargs', None) or {}).get('dsa_accuracy_compatible', False):
+            padding_to *= 2
     if args.context_parallel_size > 1:
         padding_to = (padding_to or 1) * args.context_parallel_size
     origin_padding_to = padding_to
@@ -293,7 +292,7 @@ def get_load_fixed_data_path():
 
 
 def _batch_data_suffix(step, rank, seq_len):
-    return f'step{step}_rank{rank}_seq{seq_len}.npy'
+    return f"step{step}_rank{rank}_seq{seq_len}.npy"
 
 
 def dump_batch_data(batch, step, seq_len):
@@ -308,10 +307,10 @@ def dump_batch_data(batch, step, seq_len):
         torch.cuda.synchronize()
     os.makedirs(dump_path, exist_ok=True)
     suffix = _batch_data_suffix(step, rank, seq_len)
-    np.save(os.path.join(dump_path, f'tokens_{suffix}'), tokens.detach().cpu().numpy())
-    np.save(os.path.join(dump_path, f'labels_{suffix}'), labels.detach().cpu().numpy())
+    np.save(os.path.join(dump_path, f"tokens_{suffix}"), tokens.detach().cpu().numpy())
+    np.save(os.path.join(dump_path, f"labels_{suffix}"), labels.detach().cpu().numpy())
     if rank == 0:
-        print(f'[DUMP_DATA_PATH] saved tokens_{suffix} and labels_{suffix}', flush=True)
+        print(f"[DUMP_DATA_PATH] saved tokens_{suffix} and labels_{suffix}", flush=True)
 
 
 def load_fixed_batch_data(batch, step, seq_len):
@@ -321,11 +320,11 @@ def load_fixed_batch_data(batch, step, seq_len):
 
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     suffix = _batch_data_suffix(step, rank, seq_len)
-    tokens_file = os.path.join(load_path, f'tokens_{suffix}')
-    labels_file = os.path.join(load_path, f'labels_{suffix}')
+    tokens_file = os.path.join(load_path, f"tokens_{suffix}")
+    labels_file = os.path.join(load_path, f"labels_{suffix}")
     if not (os.path.exists(tokens_file) and os.path.exists(labels_file)):
         if rank == 0:
-            print(f'[LOAD_FIXED_DATA_PATH] file not found: {tokens_file}', flush=True)
+            print(f"[LOAD_FIXED_DATA_PATH] file not found: {tokens_file}", flush=True)
         return batch
 
     tokens_np = np.load(tokens_file)

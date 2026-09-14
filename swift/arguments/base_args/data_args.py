@@ -78,7 +78,6 @@ class DataArguments:
     val_dataset: List[str] = field(default_factory=list)
     cached_dataset: List[str] = field(default_factory=list)
     cached_val_dataset: List[str] = field(default_factory=list)
-    pretokenized_dataset: bool = False
     tokenizer_name_or_path: Optional[str] = None
     split_dataset_ratio: float = 0.
 
@@ -123,8 +122,6 @@ class DataArguments:
         self._init_custom_dataset_info()
         if isinstance(self.cached_dataset, str):
             self.cached_dataset = [self.cached_dataset]
-        if self.pretokenized_dataset and not self.cached_dataset:
-            raise ValueError('pretokenized_dataset requires cached_dataset')
         self._init_val_dataset_exists()
 
     def _init_val_dataset_exists(self):

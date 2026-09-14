@@ -50,8 +50,8 @@ def get_mcore_model_config(args, hf_config):
     n_routed_experts = getattr(llm_config, 'n_routed_experts', None)
     if getattr(llm_config, 'model_type', None) == 'glm_moe_dsa':
         kwargs['accuracy_compatible_loss_sum_dtype'] = 'float32'
-    if n_routed_experts is not None:
-        kwargs['num_moe_experts'] = n_routed_experts
+        if n_routed_experts is not None:
+            kwargs['num_moe_experts'] = n_routed_experts
     # Checkpoint MTP metadata describes available weights, not an opt-in to
     # auxiliary training. The explicit mtp_num_layers argument below controls it.
     kwargs['mcore_model_type'] = args.megatron_model_meta.model_type

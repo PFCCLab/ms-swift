@@ -19,7 +19,7 @@ logger = get_logger()
 
 
 def get_batch_on_this_pp_rank(args, data, vp_stage=None):
-    if args.task_type == 'causal_lm' and not getattr(args, 'pretokenized_dataset', False):
+    if args.task_type == 'causal_lm':
         data['labels'] = torch.roll(data['labels'], -1, dims=-1)
         if 'loss_scale' in data:
             data['loss_scale'] = torch.roll(data['loss_scale'], -1, dims=-1)
