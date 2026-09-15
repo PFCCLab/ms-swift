@@ -183,6 +183,7 @@ def _patch_mcore_bridge_disable_te():
     import mcore_bridge.model.register as mcb_register
 
     def _force_local_spec(orig):
+
         def wrapper(*args, **kwargs):
             kwargs['use_transformer_engine'] = False
             return orig(*args, **kwargs)
@@ -201,7 +202,7 @@ def _patch_mcore_bridge_disable_te():
     origin_backend_spec_provider = _eav._get_backend_spec_provider
 
     def _local_backend_spec_provider(config):
-        if not getattr(config, 'dsa_accuracy_compatible', False):
+        if not config.uses_dsa_reference:
             return origin_backend_spec_provider(config)
         from megatron.core.models.backends import LocalSpecProvider
         return LocalSpecProvider()
@@ -273,8 +274,7 @@ def _patch_mcore_bridge_tp1_accuracy():
         @wraps(method)
         def call(self, *args, **kwargs):
             config = self.config
-            token = active.set(
-                getattr(config, 'dsa_accuracy_compatible', False) and config.tensor_model_parallel_size <= 1)
+            token = active.set(config.uses_dsa_reference and config.tensor_model_parallel_size <= 1)
             try:
                 return method(self, *args, **kwargs)
             finally:
@@ -327,7 +327,7 @@ def _patch_mcore_bridge():
             from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
             dsa_spec = layer_spec.submodules.self_attention
-            if getattr(self.config, 'norm_accuracy_compatible', False):
+            if self.config.uses_dsa_reference:
                 dsa_spec.submodules.q_layernorm = WrappedTorchNorm
                 dsa_spec.submodules.kv_layernorm = WrappedTorchNorm
             indexer = getattr(
@@ -335,7 +335,7 @@ def _patch_mcore_bridge():
                 'indexer',
                 None,
             )
-            if (getattr(self.config, 'norm_accuracy_compatible', False) and indexer is not None
+            if (self.config.uses_dsa_reference and indexer is not None
                     and getattr(indexer, 'submodules', None) is not None):
                 indexer.submodules.k_norm = WrappedTorchNorm
 

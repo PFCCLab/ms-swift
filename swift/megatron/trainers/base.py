@@ -222,8 +222,8 @@ class BaseMegatronTrainer(ABC):
         else:
             config_cls = OptimizerConfig
 
-        if args.reproducible_grad_norm and not hasattr(config_cls, 'reproducible_grad_norm'):
-            raise ValueError('reproducible_grad_norm requires a Megatron-Core version that supports it')
+        if args.use_accuracy_compatible and not hasattr(config_cls, 'use_accuracy_compatible'):
+            raise ValueError('use_accuracy_compatible requires a Megatron-Core version that supports it')
 
         kwargs = {
             f.name: getattr(args, f.name)

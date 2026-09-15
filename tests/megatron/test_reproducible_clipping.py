@@ -9,17 +9,12 @@ from swift.megatron.trainers import base as trainer_module
 from swift.pipelines.base import SwiftPipeline
 
 
-@pytest.mark.parametrize('accuracy,enabled,clip,expected', [
-    (True, True, 1.0, 1.0),
-    (True, True, 0.25, 0.25),
-    (True, True, 0.0, 0.0),
-    (True, False, 1.0, 0.0),
-    (False, False, 1.0, 1.0),
-])
-def test_constructor_preserves_explicit_clipping(accuracy, enabled, clip, expected):
+@pytest.mark.parametrize('accuracy', [False, True])
+@pytest.mark.parametrize('clip', [0.0, 0.25, 1.0])
+def test_constructor_preserves_explicit_clipping(accuracy, clip):
     args = SimpleNamespace(
         clip_grad=clip,
-        reproducible_grad_norm=enabled,
+        use_accuracy_compatible=accuracy,
         template_meta=SimpleNamespace(template_cls=None),
         model_meta=SimpleNamespace(is_multimodal=False),
         mcore_model='existing-model',
@@ -38,11 +33,11 @@ def test_constructor_preserves_explicit_clipping(accuracy, enabled, clip, expect
             patch.object(sft_module.MegatronSft, '_prepare_template', prepare_template), \
             patch('megatron.core.transformer.module._use_accuracy_compatible', return_value=accuracy):
         instance = sft_module.MegatronSft(args)
-    assert instance.args.clip_grad == expected
+    assert instance.args.clip_grad == clip
 
 
 def test_unsupported_megatron_rejects_requested_norm():
-    trainer = SimpleNamespace(args=SimpleNamespace(reproducible_grad_norm=True))
+    trainer = SimpleNamespace(args=SimpleNamespace(use_accuracy_compatible=True))
     with patch.object(trainer_module, 'mcore_016', False), \
             patch.object(trainer_module, 'OptimizerConfig', type('OldConfig', (), {})), \
             pytest.raises(ValueError, match='Megatron-Core version'):

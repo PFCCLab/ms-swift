@@ -132,9 +132,13 @@ def test_get_padding_to_sequence_parallel_uses_tp_times_two():
         attention_backend='unfused',
     )
     assert get_padding_to(args) == 2
-    args.megatron_extra_kwargs = {"dsa_accuracy_compatible": True}
+    args.use_accuracy_compatible = True
+    args.model_info = SimpleNamespace(config=SimpleNamespace(model_type="glm_moe_dsa"))
     assert get_padding_to(args) == 4
-    args.megatron_extra_kwargs = {"dsa_accuracy_compatible": False}
+    args.model_info.config.model_type = "glm4_moe"
+    assert get_padding_to(args) == 2
+    args.model_info.config.model_type = "glm_moe_dsa"
+    args.use_accuracy_compatible = False
     assert get_padding_to(args) == 2
     seq_len = 57
     assert math.ceil(seq_len / 4) * 4 == 60
@@ -159,7 +163,7 @@ def test_dsa_backend_forced_to_local_spec_when_accuracy_compatible(monkeypatch):
 
     monkeypatch.setattr(init, '_use_accuracy_compatible_enabled', lambda: True)
     init._patch_mcore_bridge_disable_te()
-    provider = eav._get_backend_spec_provider(SimpleNamespace(dsa_accuracy_compatible=True))
+    provider = eav._get_backend_spec_provider(SimpleNamespace(uses_dsa_reference=True))
     assert isinstance(provider, LocalSpecProvider)
     assert hasattr(provider, 'linear')
     assert provider.linear() is not provider.column_parallel_linear()
