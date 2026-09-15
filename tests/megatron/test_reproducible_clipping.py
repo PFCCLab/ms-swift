@@ -1,9 +1,8 @@
 """Explicit clipping survives accuracy-mode initialization."""
 
+import pytest
 from types import SimpleNamespace
 from unittest.mock import patch
-
-import pytest
 
 from swift.megatron.pipelines.train import sft as sft_module
 from swift.megatron.trainers import base as trainer_module
