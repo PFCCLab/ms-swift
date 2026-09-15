@@ -103,7 +103,7 @@ def test_get_mcore_model_config_does_not_enable_mtp_from_nested_checkpoint(monke
 
 def test_get_mcore_model_config_prefers_n_routed_experts(monkeypatch):
     _patch_model_config(monkeypatch)
-    hf_config = PretrainedConfig(model_type="glm_moe_dsa", num_experts=256, n_routed_experts=16)
+    hf_config = PretrainedConfig(model_type='glm_moe_dsa', num_experts=256, n_routed_experts=16)
 
     config = utils.get_mcore_model_config(_make_args(), hf_config)
 
@@ -133,11 +133,11 @@ def test_get_padding_to_sequence_parallel_uses_tp_times_two():
     )
     assert get_padding_to(args) == 2
     args.use_accuracy_compatible = True
-    args.model_info = SimpleNamespace(config=SimpleNamespace(model_type="glm_moe_dsa"))
+    args.model_info = SimpleNamespace(config=SimpleNamespace(model_type='glm_moe_dsa'))
     assert get_padding_to(args) == 4
-    args.model_info.config.model_type = "glm4_moe"
+    args.model_info.config.model_type = 'glm4_moe'
     assert get_padding_to(args) == 2
-    args.model_info.config.model_type = "glm_moe_dsa"
+    args.model_info.config.model_type = 'glm_moe_dsa'
     args.use_accuracy_compatible = False
     assert get_padding_to(args) == 2
     seq_len = 57
