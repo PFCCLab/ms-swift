@@ -130,14 +130,15 @@ def test_get_padding_to_sequence_parallel_uses_tp_times_two():
         fp4_format=None,
         fp4=None,
         attention_backend='unfused',
+        model_type='glm_moe_dsa',
+        model_info=SimpleNamespace(config=None),
     )
     assert get_padding_to(args) == 2
     args.use_accuracy_compatible = True
-    args.model_info = SimpleNamespace(config=SimpleNamespace(model_type='glm_moe_dsa'))
     assert get_padding_to(args) == 4
-    args.model_info.config.model_type = 'glm4_moe'
+    args.model_type = 'glm4_moe'
     assert get_padding_to(args) == 2
-    args.model_info.config.model_type = 'glm_moe_dsa'
+    args.model_type = 'glm_moe_dsa'
     args.use_accuracy_compatible = False
     assert get_padding_to(args) == 2
     seq_len = 57

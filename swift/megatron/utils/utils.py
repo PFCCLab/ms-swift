@@ -213,7 +213,7 @@ def get_padding_to(args):
     if args.tensor_model_parallel_size > 1 and args.sequence_parallel:
         padding_to = args.tensor_model_parallel_size
         # Match the DSA reference carrier without changing other TP+SP models.
-        if getattr(args, 'use_accuracy_compatible', False) and args.model_info.config.model_type == 'glm_moe_dsa':
+        if getattr(args, 'use_accuracy_compatible', False) and args.model_type == 'glm_moe_dsa':
             padding_to *= 2
     if args.context_parallel_size > 1:
         padding_to = (padding_to or 1) * args.context_parallel_size
