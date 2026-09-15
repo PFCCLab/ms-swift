@@ -222,6 +222,9 @@ class BaseMegatronTrainer(ABC):
         else:
             config_cls = OptimizerConfig
 
+        if args.reproducible_grad_norm and not hasattr(config_cls, 'reproducible_grad_norm'):
+            raise ValueError('reproducible_grad_norm requires a Megatron-Core version that supports it')
+
         kwargs = {
             f.name: getattr(args, f.name)
             for f in dataclasses.fields(config_cls) if hasattr(args, f.name) and f.name != 'loss_scale'

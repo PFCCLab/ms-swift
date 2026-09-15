@@ -549,6 +549,8 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     start_weight_decay: Optional[float] = None
     end_weight_decay: Optional[float] = None
     clip_grad: float = 1.
+    # Preserve clipping in accuracy mode and use a partition-independent L2 norm.
+    reproducible_grad_norm: bool = False
     native_unfused_adamw: bool = False
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
