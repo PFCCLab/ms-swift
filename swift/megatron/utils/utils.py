@@ -292,7 +292,7 @@ def get_load_fixed_data_path():
 
 
 def _batch_data_suffix(step, rank, seq_len):
-    return f"step{step}_rank{rank}_seq{seq_len}.npy"
+    return f'step{step}_rank{rank}_seq{seq_len}.npy'
 
 
 def dump_batch_data(batch, step, seq_len):
@@ -307,10 +307,10 @@ def dump_batch_data(batch, step, seq_len):
         torch.cuda.synchronize()
     os.makedirs(dump_path, exist_ok=True)
     suffix = _batch_data_suffix(step, rank, seq_len)
-    np.save(os.path.join(dump_path, f"tokens_{suffix}"), tokens.detach().cpu().numpy())
-    np.save(os.path.join(dump_path, f"labels_{suffix}"), labels.detach().cpu().numpy())
+    np.save(os.path.join(dump_path, f'tokens_{suffix}'), tokens.detach().cpu().numpy())
+    np.save(os.path.join(dump_path, f'labels_{suffix}'), labels.detach().cpu().numpy())
     if rank == 0:
-        print(f"[DUMP_DATA_PATH] saved tokens_{suffix} and labels_{suffix}", flush=True)
+        print(f'[DUMP_DATA_PATH] saved tokens_{suffix} and labels_{suffix}', flush=True)
 
 
 def load_fixed_batch_data(batch, step, seq_len):
@@ -320,11 +320,11 @@ def load_fixed_batch_data(batch, step, seq_len):
 
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     suffix = _batch_data_suffix(step, rank, seq_len)
-    tokens_file = os.path.join(load_path, f"tokens_{suffix}")
-    labels_file = os.path.join(load_path, f"labels_{suffix}")
+    tokens_file = os.path.join(load_path, f'tokens_{suffix}')
+    labels_file = os.path.join(load_path, f'labels_{suffix}')
     if not (os.path.exists(tokens_file) and os.path.exists(labels_file)):
         if rank == 0:
-            print(f"[LOAD_FIXED_DATA_PATH] file not found: {tokens_file}", flush=True)
+            print(f'[LOAD_FIXED_DATA_PATH] file not found: {tokens_file}', flush=True)
         return batch
 
     tokens_np = np.load(tokens_file)
