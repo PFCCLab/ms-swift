@@ -81,8 +81,8 @@ class AccuracyLossAndNormTest(unittest.TestCase):
         provider_norm = type('ProviderNorm', (), {})
         module = types.ModuleType('megatron.core.transformer.torch_norm')
         module.WrappedTorchNorm = native_norm
-        for enabled in (False, True):
-            with self.subTest(accuracy=enabled):
+        for enabled, norm_accuracy in ((False, False), (True, False), (True, True)):
+            with self.subTest(accuracy=enabled, norm_accuracy=norm_accuracy):
                 calls = []
                 replace_spec = production_function(
                     'swift/megatron/init.py', 'replace_spec_dsa', {
@@ -96,12 +96,12 @@ class AccuracyLossAndNormTest(unittest.TestCase):
                         kv_layernorm=provider_norm,
                         core_attention=types.SimpleNamespace(submodules=types.SimpleNamespace(indexer=indexer))))
                 spec = types.SimpleNamespace(submodules=types.SimpleNamespace(self_attention=attention))
-                loader = types.SimpleNamespace(config=types.SimpleNamespace(uses_dsa_reference=enabled))
+                loader = types.SimpleNamespace(config=types.SimpleNamespace(norm_accuracy_compatible=norm_accuracy))
                 with patch.dict(sys.modules, {module.__name__: module}):
                     replace_spec(loader, spec)
                 self.assertEqual(calls, ['provider'])
-                self.assertIs(indexer.submodules.k_norm, native_norm if enabled else provider_norm)
-                expected_qkv = native_norm if enabled else provider_norm
+                self.assertIs(indexer.submodules.k_norm, native_norm if norm_accuracy else provider_norm)
+                expected_qkv = native_norm if norm_accuracy else provider_norm
                 self.assertIs(attention.submodules.q_layernorm, expected_qkv)
                 self.assertIs(attention.submodules.kv_layernorm, expected_qkv)
 
