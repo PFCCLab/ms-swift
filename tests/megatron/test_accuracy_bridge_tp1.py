@@ -45,7 +45,7 @@ class TestBridgeTp1Patch(unittest.TestCase):
 
     def instance(self, cls, enabled, tp_size=1):
         instance = cls()
-        instance.config = SimpleNamespace(dsa_accuracy_compatible=enabled, tensor_model_parallel_size=tp_size)
+        instance.config = SimpleNamespace(uses_dsa_reference=enabled, tensor_model_parallel_size=tp_size)
         return instance
 
     def test_idempotent(self):

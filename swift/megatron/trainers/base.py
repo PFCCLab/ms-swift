@@ -222,6 +222,9 @@ class BaseMegatronTrainer(ABC):
         else:
             config_cls = OptimizerConfig
 
+        if args.use_accuracy_compatible and not hasattr(config_cls, 'use_accuracy_compatible'):
+            raise ValueError('use_accuracy_compatible requires a Megatron-Core version that supports it')
+
         kwargs = {
             f.name: getattr(args, f.name)
             for f in dataclasses.fields(config_cls) if hasattr(args, f.name) and f.name != 'loss_scale'

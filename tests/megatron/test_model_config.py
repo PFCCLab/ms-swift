@@ -103,7 +103,7 @@ def test_get_mcore_model_config_does_not_enable_mtp_from_nested_checkpoint(monke
 
 def test_get_mcore_model_config_prefers_n_routed_experts(monkeypatch):
     _patch_model_config(monkeypatch)
-    hf_config = PretrainedConfig(model_type="glm_moe_dsa", num_experts=256, n_routed_experts=16)
+    hf_config = PretrainedConfig(model_type='glm_moe_dsa', num_experts=256, n_routed_experts=16)
 
     config = utils.get_mcore_model_config(_make_args(), hf_config)
 
@@ -130,11 +130,16 @@ def test_get_padding_to_sequence_parallel_uses_tp_times_two():
         fp4_format=None,
         fp4=None,
         attention_backend='unfused',
+        model_type='glm_moe_dsa',
+        model_info=SimpleNamespace(config=None),
     )
     assert get_padding_to(args) == 2
-    args.megatron_extra_kwargs = {"dsa_accuracy_compatible": True}
+    args.use_accuracy_compatible = True
     assert get_padding_to(args) == 4
-    args.megatron_extra_kwargs = {"dsa_accuracy_compatible": False}
+    args.model_type = 'glm4_moe'
+    assert get_padding_to(args) == 2
+    args.model_type = 'glm_moe_dsa'
+    args.use_accuracy_compatible = False
     assert get_padding_to(args) == 2
     seq_len = 57
     assert math.ceil(seq_len / 4) * 4 == 60
@@ -159,7 +164,7 @@ def test_dsa_backend_forced_to_local_spec_when_accuracy_compatible(monkeypatch):
 
     monkeypatch.setattr(init, '_use_accuracy_compatible_enabled', lambda: True)
     init._patch_mcore_bridge_disable_te()
-    provider = eav._get_backend_spec_provider(SimpleNamespace(dsa_accuracy_compatible=True))
+    provider = eav._get_backend_spec_provider(SimpleNamespace(uses_dsa_reference=True))
     assert isinstance(provider, LocalSpecProvider)
     assert hasattr(provider, 'linear')
     assert provider.linear() is not provider.column_parallel_linear()
