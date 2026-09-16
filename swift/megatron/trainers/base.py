@@ -209,6 +209,10 @@ class BaseMegatronTrainer(ABC):
 
     def get_optimizer_and_scheduler(self):
         args = self.args
+        if args.use_accuracy_compatible and args.clip_grad > 0:
+            from megatron.core.optimizer import clip_grads
+            if not hasattr(clip_grads, 'get_reproducible_grad_norm_bins'):
+                raise ValueError('Accuracy-compatible clipping requires Megatron-Core reproducible norm support')
         if mcore_016:
             from megatron.core.optimizer import AdamOptimizerConfig, SGDOptimizerConfig
             if args.optimizer == 'adam' or 'muon' in args.optimizer:
