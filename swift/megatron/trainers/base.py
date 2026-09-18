@@ -736,6 +736,57 @@ class BaseMegatronTrainer(ABC):
         maybe_finalize_async_save(self.args, blocking=True, terminate=True)
 
     def train(self, train_dataset, val_dataset):
+        if (os.environ.get('USE_ACCURACY_COMPATIBLE', '0') == '1'
+                and os.environ.get('ALIGN_LMHEAD_WGRAD_FP64', '1') == '1'):
+            try:
+                import types as _types
+
+                def _install_fp64_lmhead_wgrad(_model):
+                    ol = getattr(_model, 'output_layer', None)
+                    if ol is None or getattr(ol, '_fp64_wgrad_installed', False):
+                        return False
+                    _orig_forward = ol.forward
+
+                    class _LmHeadFp64Wgrad(torch.autograd.Function):
+                        @staticmethod
+                        def forward(ctx, inp, weight):
+                            ctx.save_for_backward(inp, weight)
+                            with torch.no_grad():
+                                out = _orig_forward(inp)
+                            logits = out[0] if isinstance(out, (tuple, list)) else out
+                            return logits.detach()
+
+                        @staticmethod
+                        def backward(ctx, grad_out):
+                            inp, weight = ctx.saved_tensors
+                            grad_inp = torch.matmul(grad_out, weight)
+                            g2 = grad_out.reshape(-1, grad_out.shape[-1])
+                            in2 = inp.reshape(-1, inp.shape[-1])
+                            gd = g2.double()
+                            hd = in2.double()
+                            acc = torch.zeros(
+                                g2.shape[1], in2.shape[1],
+                                dtype=torch.float64, device=g2.device)
+                            for t in range(gd.shape[0]):
+                                acc.add_(gd[t].unsqueeze(1) * hd[t].unsqueeze(0))
+                            grad_weight = acc.to(weight.dtype)
+                            return grad_inp, grad_weight
+
+                    def _new_forward(self, hidden_states, *args, **kwargs):
+                        logits = _LmHeadFp64Wgrad.apply(hidden_states, self.weight)
+                        return logits, None
+
+                    ol.forward = _types.MethodType(_new_forward, ol)
+                    ol._fp64_wgrad_installed = True
+                    logger.info(
+                        f'[ALIGN] fp64 lm_head wgrad installed on '
+                        f'{type(ol).__name__} (weight {list(ol.weight.shape)})')
+                    return True
+
+                for _m in self.unwrapped_models:
+                    _install_fp64_lmhead_wgrad(_m)
+            except Exception as _e:  # noqa
+                logger.exception(f'[ALIGN] install fp64 lm_head wgrad failed: {_e}')
         train_data_iterator, val_data_iterator = self.setup_training(train_dataset, val_dataset)
         while self.state.iteration < self.args.train_iters:
             self.run_train_step(train_data_iterator, val_data_iterator)
