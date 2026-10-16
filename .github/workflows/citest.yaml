@@ -71,6 +71,15 @@ jobs:
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: |
           set -euo pipefail
+          # Revisions without LFS pointers need no hydration or Git LFS installation.
+          if git grep -I -q '^version https://git-lfs.github.com/spec/v1$' HEAD --; then
+            echo "Hydrating this revision's LFS objects"
+          else
+            status=$?
+            if [ "$status" -ne 1 ]; then exit "$status"; fi
+            echo "No LFS pointers in this revision"
+            exit 0
+          fi
           if ! git lfs version; then
             case "$(uname -m)" in
               x86_64)
