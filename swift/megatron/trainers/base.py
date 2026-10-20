@@ -736,7 +736,7 @@ class BaseMegatronTrainer(ABC):
         maybe_finalize_async_save(self.args, blocking=True, terminate=True)
 
     def train(self, train_dataset, val_dataset):
-      if (os.environ.get('USE_ACCURACY_COMPATIBLE', '0') == '1'
+        if (os.environ.get('USE_ACCURACY_COMPATIBLE', '0') == '1'
                 and os.environ.get('ALIGN_LMHEAD_WGRAD_FP64', '1') == '1'):
             try:
                 import types as _types
