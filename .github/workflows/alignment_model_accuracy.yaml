@@ -120,9 +120,15 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::Build ms-swift wheel"
+          # 只打包纯 Python wheel，不安装 requirements（torch/nvidia 等数 GB）；
+          # 对齐测试在 setup_venvs.sh 的 venv 里以 --no-deps 安装这个 wheel
           cd /workspace/ms-swift
           pip config set global.cache-dir "/home/.cache/pip"
-          bash scripts/dependence/build.sh
+          rm -rf build/ dist/ ms_swift.egg-info/
+          python -m pip install -q -i https://pypi.tuna.tsinghua.edu.cn/simple setuptools wheel
+          python setup.py -q bdist_wheel
+          mkdir -p /workspace/upload
+          cp dist/ms_swift-*.whl /workspace/upload/ms_swift-0.0.0-py3-none-any.whl
           ls -l /workspace/upload/
           echo "::endgroup::"
           '
