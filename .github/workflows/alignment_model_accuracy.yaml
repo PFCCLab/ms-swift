@@ -64,11 +64,9 @@ jobs:
             export GIT_TERMINAL_PROMPT=0
             rm -rf * .[^.]*
             source $work_dir/../../../proxy
-            echo "Download PaddleFleet form https://paddle-qa.bj.bcebos.com/CodeSync/develop/PaddleFleet.tar"
-            wget -q --no-proxy  https://paddle-qa.bj.bcebos.com/CodeSync/develop/PaddleFleet.tar --no-check-certificate
-            rm -rf PaddleFleet && tar xf PaddleFleet.tar && rm -rf PaddleFleet.tar
-            cd PaddleFleet && git pull && cd -
-
+            # PaddleFleet 为私有仓库，由 runner 的 pre-job 钩子在宿主机上准备好
+            cp -a $work_dir/../../../PaddleFleet ./PaddleFleet \
+              || { echo "::error::PaddleFleet 未就绪，检查 runner pre-job 钩子输出"; exit 1; }
             echo "Download ms-swift form https://paddle-github-action.bj.bcebos.com/whl/ms-swift.tar.gz"
             wget -q --no-proxy https://paddle-github-action.bj.bcebos.com/whl/ms-swift.tar.gz --no-check-certificate
             rm -rf ms-swift && tar zxf ms-swift.tar.gz && rm -rf ms-swift.tar.gz
