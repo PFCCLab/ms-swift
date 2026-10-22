@@ -25,8 +25,10 @@ defaults:
 jobs:
   alignment_model_accuracy:
     name: alignment_model_accuracy
+    timeout-minutes: 240
     runs-on:
       group: h20-2c
+      labels: [fleet-gate]   # 只有装了 PaddleFleet 钩子的 runner 带这个 label
     steps:
       - name: Determine the runner
         run: |
@@ -37,7 +39,7 @@ jobs:
           determine_gpu_runner ${runner_name}
       - name: Determine Image Name
         run: |
-          echo "IMAGE_NAME=ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddle:ubuntu24-cuda129-py312-dev" >> "$GITHUB_ENV"
+          echo "IMAGE_NAME=ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddle:ubuntu24-cuda130-py312-dev" >> "$GITHUB_ENV"
       - name: Run Container
         run: |
           container_name=${TASK}-$(date +%Y%m%d-%H%M%S)
@@ -59,12 +61,12 @@ jobs:
       - name: Checkout Code
         run: |
           docker exec -t $container_name /bin/bash -c '
+            export GIT_TERMINAL_PROMPT=0
             rm -rf * .[^.]*
             source $work_dir/../../../proxy
-            echo "Download PaddleFleet form https://paddle-qa.bj.bcebos.com/CodeSync/develop/PaddleFleet.tar"
-            wget -q --no-proxy  https://paddle-qa.bj.bcebos.com/CodeSync/develop/PaddleFleet.tar --no-check-certificate
-            rm -rf PaddleFleet && tar xf PaddleFleet.tar && rm -rf PaddleFleet.tar
-            cd PaddleFleet && git pull && cd -
+            # PaddleFleet 为私有仓库，由 runner 的 pre-job 钩子在宿主机上准备好
+            cp -a $work_dir/../../../PaddleFleet ./PaddleFleet \
+              || { echo "::error::PaddleFleet 未就绪，检查 runner pre-job 钩子输出"; exit 1; }
 
             echo "Download ms-swift form https://paddle-github-action.bj.bcebos.com/whl/ms-swift.tar.gz"
             wget -q --no-proxy https://paddle-github-action.bj.bcebos.com/whl/ms-swift.tar.gz --no-check-certificate
@@ -75,7 +77,8 @@ jobs:
             git submodule update --init --recursive --force
             if [ -n "$PR_ID" ] && [ "$PR_ID" != "0" ]; then
               git fetch origin pull/${PR_ID}/head
-              git checkout -b PR_${PR_ID} FETCH_HEAD
+              # 检出触发本次 run 的 commit（即审批过的那个），而不是 fetch 时刻的最新 head
+              git checkout -b PR_${PR_ID} ${COMMIT_ID}
               git remote add upstream https://github.com/PFCCLab/ms-swift.git
               echo "Checking out ${BRANCH}..."
               git fetch upstream ${BRANCH}:${BRANCH}
@@ -109,24 +112,23 @@ jobs:
           python --version
           ldconfig
 
-          BOS=https://paddle-github-action.bj.bcebos.com
-          echo "::group::Download paddlefleet / paddlefleet_ops / megatron-core / mcore-bridge wheels from BOS"
+          echo "::group::Copy paddlefleet / paddlefleet_ops / megatron-core / mcore-bridge wheels prepared by runner pre-job hook"
           cd /workspace
-          for url in \
-            $BOS/PaddleFleet/develop/latest/paddlefleet-0.0.0-py3-none-linux_x86_64.whl \
-            $BOS/PaddleFleet/develop/latest/cu129/paddle-release/paddlefleet_ops-0.0.0-cp312-cp312-linux_x86_64.whl \
-            $BOS/whl/megatron_core-0.0.0-cp312-cp312-linux_x86_64.whl \
-            $BOS/whl/mcore_bridge-0.0.0-py3-none-any.whl ; do
-            echo "Downloading $url"
-            wget -q --no-proxy --no-check-certificate --tries=3 --timeout=60 "$url"
-          done
+          cp -a $work_dir/../../../wheels/*.whl /workspace/ \
+            || { echo "::error::wheels 未就绪，检查 runner pre-job 钩子输出"; exit 1; }
           ls -l /workspace/
           echo "::endgroup::"
 
           echo "::group::Build ms-swift wheel"
+          # 只打包纯 Python wheel，不安装 requirements（torch/nvidia 等数 GB）；
+          # 对齐测试在 setup_venvs.sh 的 venv 里以 --no-deps 安装这个 wheel
           cd /workspace/ms-swift
           pip config set global.cache-dir "/home/.cache/pip"
-          bash scripts/dependence/build.sh
+          rm -rf build/ dist/ ms_swift.egg-info/
+          python -m pip install -q -i https://pypi.tuna.tsinghua.edu.cn/simple setuptools wheel
+          python setup.py -q bdist_wheel
+          mkdir -p /workspace/upload
+          cp dist/ms_swift-*.whl /workspace/upload/ms_swift-0.0.0-py3-none-any.whl
           ls -l /workspace/upload/
           echo "::endgroup::"
           '
@@ -155,7 +157,7 @@ jobs:
             echo "using $whl"
           done
           python -m pip install uv
-          bash PaddleFleet/scripts/alignment_model_accuracy/setup_venvs.sh
+          # run_alignment_test.sh 内部会调用 setup_venvs.sh，这里不再重复执行
           bash -x PaddleFleet/scripts/alignment_model_accuracy/run_alignment_test.sh
 
           model_acc_align_exit_code=$?
